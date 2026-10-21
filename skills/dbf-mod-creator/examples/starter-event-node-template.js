@@ -86,7 +86,7 @@ module.exports = function (DBFMod) {
     inputs: [],
     outputs: [
       {
-        name: "Trigger",
+        name: "Output",
         type: "event"
       }
     ],

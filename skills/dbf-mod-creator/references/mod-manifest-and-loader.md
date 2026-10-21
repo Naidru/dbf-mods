@@ -38,7 +38,7 @@ When a mod's editor script in `nodes/` is loaded, it is provided with the `DBFMo
 | Method | Signature | Description |
 | :--- | :--- | :--- |
 | `registerActionNode` | `(category: string, config: object)` | Registers an action node in the specified catalog category with standard trigger/output event pins. |
-| `registerEventNode` | `(config: object)` | Registers a starter event node under the `"Discord Events"` category with no input pins and a single `"Trigger"` output pin. |
+| `registerEventNode` | `(config: object)` | Registers a starter event node under the `"Discord Events"` category with no input pins and a single `"Output"` output pin. |
 | `registerSocialEventNode`| `(config: object)` | Registers an external webhook/polling event trigger under `"Social events"`. |
 | `registerNode` | `(category: string, config: object)` | Registers a custom node with user-defined input and output slot arrays. |
 

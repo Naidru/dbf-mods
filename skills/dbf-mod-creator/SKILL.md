@@ -63,7 +63,7 @@ Mod runtime scripts (`runtime.js`) are executed in the bot process when flows ar
 - Capture and store references to `client` and `runFlowWithMessage` when they become available so that background schedulers and asynchronous event handlers can trigger flows anytime.
 
 ### Contract 3: How Starter / Event Nodes Trigger Flows
-1. Register the node with `DBFMod.registerEventNode(nodeConfig)` (which configures `inputs: []`, `outputs: [{ name: "Trigger", type: "event" }]`, and category `"Discord Events"`).
+1. Register the node with `DBFMod.registerEventNode(nodeConfig)` (which configures `inputs: []`, `outputs: [{ name: "Output", type: "event" }]`, and category `"Discord Events"`).
 2. In `codegen`:
    ```javascript
    codegen: {
@@ -86,6 +86,13 @@ Mod runtime scripts (`runtime.js`) are executed in the bot process when flows ar
    - **Populate `stub.guild`, `stub.member`, and IDs**: Ensure `stub.guildId`, `stub.channelId`, `stub.user`, and `stub.member` (defaulting to `guild.members.me`) are present so permission checks and guild-scoped variables succeed.
    - **Wrap Variable Saving in `try / catch`**: Always enclose `saveSnippet` execution in `try / catch` so missing properties or scopes never cause condition evaluation to abort.
    - See [examples/runtime-template.js](./examples/runtime-template.js) for the complete implementation.
+5. **Large Project & Multi-Tab Standards (`runtimeId` vs `node.id`)**:
+   - **CRITICAL — Multi-Tab `runtimeId` Re-Indexing**: When DBF compiles a multi-tab project into `bot.js`, it merges all tabs and assigns each node a sequential 1-based `runtimeId` (e.g. `'605'`), passing that `runtimeId` as `nodeData.id` into `buildCondition(nodeData, ctx)`. However, `bot.config.json` retains the original per-tab LiteGraph `node.id` (e.g. `761`). In `runtime.js`, always parse DBF's `__dbfStartFlowRun({ id: '761', runtimeId: '605', ... type: 'MyNodeType', ... tabId: '...' })` metadata from `bot.js` to map `(tabId, originalId) -> runtimeId`, and pass `nodeId: runtimeId`, `runtimeId`, and `originalId` in the event payload!
+   - **String-Serialized Booleans (`"false"` / `"true"`)**: DBF's modal serializer can store boolean properties in `bot.config.json` as strings (`"false"` or `"true"`). Never use `!!node.properties.myBool` (since `!!"false"` is `true` in JavaScript!). Always use a `toBool(val)` helper (`val === true || String(val).trim().toLowerCase() === "true"`).
+   - Never deduplicate active nodes across tabs solely by numeric `node.id`; use a composite key `${tabKey}_${node.id}` so nodes in separate tabs are never skipped.
+   - Support both object (`cfg.flowTabs.tabs`) and direct array (`cfg.flowTabs`) formats, as well as `tab.flow.nodes`, `tab.nodes`, and root `cfg.flow.nodes`.
+   - Verify bot permissions (`ViewChannel` and `SendMessages`) before picking a text channel from cache, preventing read-only `#rules` or `#welcome` channels from being selected in large Discord servers.
+   - **Never run variable registration or `localStorage` operations inside `drawForeground()`**: Canvas repaints occur up to 60 times a second; graph traversal and synchronous storage inside `drawForeground()` cause severe lag in large projects. Confine variable registration strictly to `onPropertyChanged("saveVar")`, `onConfigure()`, and `modalFields()`.
 
 ### Contract 4: How Action Nodes & Branching Slots Work
 1. Register the node with `DBFMod.registerActionNode("CategoryName", nodeConfig)`.
