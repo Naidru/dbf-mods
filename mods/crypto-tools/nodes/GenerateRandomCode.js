@@ -1338,7 +1338,6 @@ module.exports = function (DBFMod) {
       }
     },
     drawForeground(ctx) {
-      registerCryptoNodeVars(this);
       const fmt = String(this.properties?.format || "alphanumeric");
       let summary = "";
       if (fmt === "alphanumeric") {

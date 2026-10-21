@@ -1520,6 +1520,16 @@ function describeCronExpression(expr, tz = "UTC+00:00") {
   };
 }
 
+function toBool(val) {
+  if (typeof val === "boolean") return val;
+  if (typeof val === "string") {
+    const s = val.trim().toLowerCase();
+    return s === "true" || s === "1" || s === "yes";
+  }
+  if (typeof val === "number") return val !== 0;
+  return false;
+}
+
 module.exports = function (DBFMod) {
   const nodeConfig = {
     type: "CronTrigger",
@@ -1538,7 +1548,7 @@ module.exports = function (DBFMod) {
     inputs: [],
     outputs: [
       {
-        name: "Trigger",
+        name: "Output",
         type: "event"
       }
     ],
@@ -1550,9 +1560,15 @@ module.exports = function (DBFMod) {
       saveVar: ""
     },
     onNodeCreated() {
+      if (this.outputs && this.outputs.length > 0) {
+        this.outputs[0].name = "Output";
+      }
       registerCronNodeVars(this);
     },
     onConfigure() {
+      if (this.outputs && this.outputs.length > 0) {
+        this.outputs[0].name = "Output";
+      }
       registerCronNodeVars(this);
     },
     autoTitle(node) {
@@ -1569,11 +1585,10 @@ module.exports = function (DBFMod) {
       }
     },
     drawForeground(ctx) {
-      registerCronNodeVars(this);
       const expr = String(this.properties?.cronExpression || "0 0 * * *").trim();
       const tz = String(this.properties?.timezone || "UTC+00:00").trim();
-      const startup = !!this.properties?.runOnStartup;
-      const logConsole = !!this.properties?.logToConsole;
+      const startup = toBool(this.properties?.runOnStartup);
+      const logConsole = toBool(this.properties?.logToConsole);
       const desc = describeCronExpression(expr, tz);
 
       // Header Badge
@@ -1770,14 +1785,14 @@ module.exports = function (DBFMod) {
         {
           label: "Run Once on Bot Startup",
           property: "runOnStartup",
-          value: !!node.properties.runOnStartup,
+          value: toBool(node.properties.runOnStartup),
           type: "boolean",
           help: "When enabled, triggers this flow immediately once the bot logs into Discord (Disabled by default)."
         },
         {
           label: "Log Schedule Execution to Console",
           property: "logToConsole",
-          value: !!node.properties.logToConsole,
+          value: toBool(node.properties.logToConsole),
           type: "boolean",
           help: "When enabled, prints a confirmation message to the bot console whenever this schedule triggers (Disabled by default)."
         },
@@ -1802,9 +1817,11 @@ module.exports = function (DBFMod) {
         const id = String(nodeData?.id ?? "").trim();
         const idEsc = escapeJsStr(id, ctx);
         const expr = String(nodeData?.properties?.cronExpression || "0 0 * * *").trim();
+        const exprEsc = escapeJsStr(expr, ctx);
         const tz = String(nodeData?.properties?.timezone || "UTC+00:00").trim();
+        const tzEsc = escapeJsStr(tz, ctx);
         const desc = describeCronExpression(expr, tz);
-        const condition = `(message.__eventType === 'cronTrigger' && (String(message.__eventPayload?.nodeId || '').trim() === '${idEsc}' || message.__eventPayload?.nodeId == '${idEsc}'))`;
+        const condition = `(message.__eventType === 'cronTrigger' && (String(message.__eventPayload?.nodeId || '').trim() === '${idEsc}' || String(message.__eventPayload?.runtimeId || '').trim() === '${idEsc}' || String(message.__eventPayload?.originalId || '').trim() === '${idEsc}' || message.__eventPayload?.nodeId == '${idEsc}' || (message.__eventPayload?.cronExpression === '${exprEsc}' && message.__eventPayload?.timezone === '${tzEsc}' && (!message.__eventPayload?.runtimeId || String(message.__eventPayload?.runtimeId) === '${idEsc}'))))`;
         const label = `When Cron Schedule Triggers (${expr} - ${desc.timezoneAbbr})`;
         return buildSaveVarCondition(
           condition,

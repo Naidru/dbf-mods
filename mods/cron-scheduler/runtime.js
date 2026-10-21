@@ -343,55 +343,204 @@ globalThis.__dbfCronSchedulerRuntimeLoaded = true;
     return globalThis.__dbfDiscordClient || null;
   }
 
+  let lastStatCheck = 0;
+  let cachedBotJsMtime = 0;
+  let cachedRuntimeIdMap = new Map();
+
+  function toBool(val) {
+    if (typeof val === "boolean") return val;
+    if (typeof val === "string") {
+      const s = val.trim().toLowerCase();
+      return s === "true" || s === "1" || s === "yes";
+    }
+    if (typeof val === "number") return val !== 0;
+    return false;
+  }
+
   function findProjectConfigFile() {
     const candidates = [
+      process.env.DBF_CONFIG_PATH,
+      globalThis.__dbfConfigPath,
       path.join(process.cwd(), "bot.config.json"),
+      path.join(process.cwd(), "..", "bot.config.json"),
       path.join(__dirname, "bot.config.json"),
       path.join(__dirname, "..", "bot.config.json"),
-      path.join(__dirname, "..", "..", "bot.config.json")
-    ];
+      path.join(__dirname, "..", "..", "bot.config.json"),
+      path.join(__dirname, "..", "..", "..", "bot.config.json")
+    ].filter(Boolean);
     for (const candidate of candidates) {
       if (fs.existsSync(candidate)) return candidate;
     }
     return null;
   }
 
+  const CRON_NODE_TYPES = new Set([
+    "CronTrigger",
+    "Events/CronTrigger",
+    "Scheduling/CronTrigger",
+    "When Cron Schedule Triggers",
+    "Cron Trigger",
+    "Quartz Trigger"
+  ]);
+
+  function isCronTriggerType(type) {
+    if (!type || typeof type !== "string") return false;
+    return CRON_NODE_TYPES.has(type) || type.includes("CronTrigger");
+  }
+
+  function isDisabledFlag(val) {
+    return val === true || val === "true" || val === 1;
+  }
+
+  function isEnabledFlag(val) {
+    if (val === undefined || val === null) return true;
+    return val !== false && val !== "false" && val !== 0;
+  }
+
+  // In multi-tab DBF projects, DBF compiles nodes with a sequential runtimeId in bot.js
+  // while bot.config.json keeps the per-tab node.id. Extract the exact mapping from bot.js.
+  function getRuntimeIdMap(configPath) {
+    try {
+      const botJsCandidates = [
+        configPath ? path.join(path.dirname(configPath), "bot.js") : null,
+        typeof process !== "undefined" && Array.isArray(process.argv) && process.argv[1] ? process.argv[1] : null,
+        path.join(process.cwd(), "bot.js")
+      ].filter(Boolean);
+
+      let botJsPath = null;
+      for (const candidate of botJsCandidates) {
+        if (fs.existsSync(candidate) && candidate.endsWith(".js")) {
+          botJsPath = candidate;
+          break;
+        }
+      }
+      if (!botJsPath) return cachedRuntimeIdMap;
+
+      const stat = fs.statSync(botJsPath);
+      if (stat.mtimeMs === cachedBotJsMtime && cachedRuntimeIdMap.size > 0) {
+        return cachedRuntimeIdMap;
+      }
+
+      const content = fs.readFileSync(botJsPath, "utf8");
+      const map = new Map();
+      const metaRegex = /\{\s*id:\s*'([^']+)'\s*,\s*runtimeId:\s*'([^']+)'[^{}]*type:\s*'([^']+)'[^{}]*tabId:\s*'([^']*)'\s*\}/g;
+      let match;
+      while ((match = metaRegex.exec(content)) !== null) {
+        const origId = match[1].trim();
+        const rtId = match[2].trim();
+        const nType = match[3].trim();
+        const tId = match[4].trim();
+        if (isCronTriggerType(nType)) {
+          if (tId) {
+            map.set(`${tId}:${origId}`, rtId);
+          }
+          if (!map.has(`*:${origId}`)) {
+            map.set(`*:${origId}`, rtId);
+          }
+        }
+      }
+
+      cachedBotJsMtime = stat.mtimeMs;
+      cachedRuntimeIdMap = map;
+      return cachedRuntimeIdMap;
+    } catch (_) {
+      return cachedRuntimeIdMap;
+    }
+  }
+
   function getActiveCronNodes() {
     const configPath = findProjectConfigFile();
     if (!configPath || !fs.existsSync(configPath)) return [];
     try {
-      const stat = fs.statSync(configPath);
-      if (stat.mtimeMs === cachedMtime) {
+      const now = Date.now();
+      // In large projects, throttle statSync to at most once every 1500ms to eliminate synchronous I/O overhead
+      if (now - lastStatCheck < 1500 && cachedNodes.length > 0) {
         return cachedNodes;
       }
-      cachedMtime = stat.mtimeMs;
+      lastStatCheck = now;
+
+      const stat = fs.statSync(configPath);
+      const runtimeIdMap = getRuntimeIdMap(configPath);
+      if (stat.mtimeMs === cachedMtime && cachedNodes.length > 0) {
+        // Ensure runtimeIds stay updated if bot.js was regenerated
+        cachedNodes.forEach((node) => {
+          const origId = String(node.id ?? "").trim();
+          const tabKey = String(node.__tabKey || "root");
+          node.__runtimeId = runtimeIdMap.get(`${tabKey}:${origId}`) || runtimeIdMap.get(`*:${origId}`) || origId;
+        });
+        return cachedNodes;
+      }
 
       const raw = fs.readFileSync(configPath, "utf8");
       const cfg = JSON.parse(raw);
       const nodes = [];
-      const seenIds = new Set();
+      const seenCompositeKeys = new Set();
 
-      const collect = (node) => {
-        if (!node || node.disabled) return;
+      const collect = (node, tabKey = "root") => {
+        if (!node) return;
+        if (isDisabledFlag(node.disabled) || !isEnabledFlag(node.enabled)) return;
+        if (!isCronTriggerType(node.type)) return;
+
         const id = String(node.id ?? "").trim();
-        if (!id || seenIds.has(id)) return;
-        if (node.type === "CronTrigger") {
-          seenIds.add(id);
-          nodes.push(node);
-        }
+        if (!id) return;
+
+        // Composite key ensures nodes in different tabs with identical LiteGraph IDs are not dropped
+        const compositeKey = `${tabKey}_${id}`;
+        if (seenCompositeKeys.has(compositeKey)) return;
+        seenCompositeKeys.add(compositeKey);
+
+        // Store tab, composite uniqueId, and compiled runtimeId
+        node.__tabKey = tabKey;
+        node.__uniqueId = compositeKey;
+        node.__runtimeId = runtimeIdMap.get(`${tabKey}:${id}`) || runtimeIdMap.get(`*:${id}`) || id;
+        nodes.push(node);
       };
 
-      if (cfg.flowTabs && Array.isArray(cfg.flowTabs.tabs)) {
-        cfg.flowTabs.tabs.forEach((tab) => {
-          if (tab && !tab.disabled && tab.flow && Array.isArray(tab.flow.nodes)) {
-            tab.flow.nodes.forEach(collect);
+      // 1. Support multi-tab flow structures (flowTabs as object or array)
+      const tabs = Array.isArray(cfg.flowTabs)
+        ? cfg.flowTabs
+        : (cfg.flowTabs && Array.isArray(cfg.flowTabs.tabs) ? cfg.flowTabs.tabs : (Array.isArray(cfg.tabs) ? cfg.tabs : []));
+
+      tabs.forEach((tab, index) => {
+        if (!tab) return;
+        if (isDisabledFlag(tab.disabled) || !isEnabledFlag(tab.enabled)) return;
+        const tabKey = String(tab.id || tab.name || `tab_${index}`);
+
+        const tabNodes = Array.isArray(tab.flow?.nodes)
+          ? tab.flow.nodes
+          : (Array.isArray(tab.nodes)
+            ? tab.nodes
+            : (Array.isArray(tab.flow?.graph?.nodes)
+              ? tab.flow.graph.nodes
+              : (Array.isArray(tab.graph?.nodes) ? tab.graph.nodes : [])));
+
+        tabNodes.forEach((n) => collect(n, tabKey));
+      });
+
+      // 2. Support root/single flow structures
+      const rootNodes = Array.isArray(cfg.flow?.nodes)
+        ? cfg.flow.nodes
+        : (Array.isArray(cfg.nodes)
+          ? cfg.nodes
+          : (Array.isArray(cfg.flow?.graph?.nodes)
+            ? cfg.flow.graph.nodes
+            : (Array.isArray(cfg.graph?.nodes) ? cfg.graph.nodes : [])));
+
+      rootNodes.forEach((n) => collect(n, "root"));
+
+      // 3. Support multi-flow list structures (cfg.flows = [{ nodes: [] }])
+      if (Array.isArray(cfg.flows)) {
+        cfg.flows.forEach((fl, idx) => {
+          if (!fl || isDisabledFlag(fl.disabled)) return;
+          const flKey = String(fl.id || fl.name || `flow_${idx}`);
+          if (Array.isArray(fl.nodes)) {
+            fl.nodes.forEach((n) => collect(n, flKey));
           }
         });
       }
-      if (cfg.flow && Array.isArray(cfg.flow.nodes)) {
-        cfg.flow.nodes.forEach(collect);
-      }
 
+      // Update cachedMtime ONLY after JSON parsing and node extraction succeeds
+      cachedMtime = stat.mtimeMs;
       cachedNodes = nodes;
       return cachedNodes;
     } catch (_) {
@@ -643,7 +792,7 @@ globalThis.__dbfCronSchedulerRuntimeLoaded = true;
     }
   }
 
-  async function waitForClientReady(client, maxWaitMs = 5000) {
+  async function waitForClientReady(client, maxWaitMs = 15000) {
     if (!client) return;
     if (client.isReady && typeof client.isReady === "function" && client.isReady()) return;
     if (client.user && client.guilds?.cache?.size) return;
@@ -677,32 +826,74 @@ globalThis.__dbfCronSchedulerRuntimeLoaded = true;
     });
   }
 
-  async function resolveBestGuildAndChannel(botClient) {
+  function canBotSendInChannel(channel, client) {
+    if (!channel || typeof channel.send !== "function") return false;
+    const isText = (typeof channel.isTextBased === "function" && channel.isTextBased()) ||
+      channel.type === 0 ||
+      channel.type === "GUILD_TEXT";
+    if (!isText) return false;
+
+    // In guild channels, verify the bot actually has ViewChannel and SendMessages permissions
+    if (channel.guild && client?.user) {
+      try {
+        if (typeof channel.permissionsFor === "function") {
+          const perms = channel.permissionsFor(client.user);
+          if (perms && typeof perms.has === "function") {
+            const canView = perms.has("ViewChannel") || perms.has(1024n) || perms.has(1024);
+            const canSend = perms.has("SendMessages") || perms.has(2048n) || perms.has(2048);
+            if (!canView || !canSend) return false;
+          }
+        }
+      } catch (_) {}
+    }
+    return true;
+  }
+
+  async function resolveBestGuildAndChannel(botClient, node = null) {
     if (!botClient) return { guild: null, channel: null };
 
-    // If client is still logging in, wait up to 5s for ready state so channels and guilds are populated
-    await waitForClientReady(botClient, 5000);
+    // If client is still logging in, wait up to 15s for ready state so large multi-guild bots populate
+    await waitForClientReady(botClient, 15000);
 
     let targetGuild = null;
     let targetChannel = null;
 
-    // 1. Search botClient.channels.cache directly across all guilds
+    // A. Check if the node configured an explicit channel ID
+    const explicitChannelId = String(
+      node?.properties?.targetChannelId ||
+      node?.properties?.channelId ||
+      ""
+    ).trim();
+
+    if (explicitChannelId) {
+      targetChannel = botClient.channels?.cache?.get(explicitChannelId) || null;
+      if (!targetChannel && typeof botClient.channels?.fetch === "function") {
+        try {
+          targetChannel = await botClient.channels.fetch(explicitChannelId);
+        } catch (_) {}
+      }
+      if (targetChannel) {
+        return { guild: targetChannel.guild || null, channel: targetChannel };
+      }
+    }
+
+    // B. Search botClient.channels.cache directly across all guilds for a channel the bot can actually send in
     if (botClient.channels?.cache?.size) {
       targetChannel = botClient.channels.cache.find(
-        (c) => c && typeof c.send === "function" && (c.isTextBased?.() || c.type === 0 || c.type === "GUILD_TEXT")
+        (c) => canBotSendInChannel(c, botClient)
       ) || null;
       if (targetChannel && targetChannel.guild) {
         targetGuild = targetChannel.guild;
       }
     }
 
-    // 2. Iterate through all cached guilds if not found in global channels cache
+    // C. Iterate through all cached guilds if not found
     if (!targetChannel && botClient.guilds?.cache?.size) {
       for (const guild of botClient.guilds.cache.values()) {
         if (!guild) continue;
         if (guild.channels?.cache?.size) {
           const ch = guild.channels.cache.find(
-            (c) => c && typeof c.send === "function" && (c.isTextBased?.() || c.type === 0 || c.type === "GUILD_TEXT")
+            (c) => canBotSendInChannel(c, botClient)
           );
           if (ch) {
             targetGuild = guild;
@@ -713,7 +904,7 @@ globalThis.__dbfCronSchedulerRuntimeLoaded = true;
       }
     }
 
-    // 3. If channels cache is empty, attempt to fetch channels for available guilds
+    // D. If channels cache is empty, attempt to fetch channels for available guilds
     if (!targetChannel && botClient.guilds?.cache?.size) {
       for (const guild of botClient.guilds.cache.values()) {
         if (!guild) continue;
@@ -722,7 +913,7 @@ globalThis.__dbfCronSchedulerRuntimeLoaded = true;
             const fetched = await guild.channels.fetch();
             if (fetched && fetched.size) {
               const ch = fetched.find(
-                (c) => c && typeof c.send === "function" && (c.isTextBased?.() || c.type === 0 || c.type === "GUILD_TEXT")
+                (c) => canBotSendInChannel(c, botClient)
               );
               if (ch) {
                 targetGuild = guild;
@@ -732,6 +923,16 @@ globalThis.__dbfCronSchedulerRuntimeLoaded = true;
             }
           } catch (_) {}
         }
+      }
+    }
+
+    // E. Fallback: Any text-based channel if permission check was strict
+    if (!targetChannel && botClient.channels?.cache?.size) {
+      targetChannel = botClient.channels.cache.find(
+        (c) => c && typeof c.send === "function" && ((c.isTextBased?.()) || c.type === 0 || c.type === "GUILD_TEXT")
+      ) || null;
+      if (targetChannel && targetChannel.guild) {
+        targetGuild = targetChannel.guild;
       }
     }
 
@@ -747,17 +948,24 @@ globalThis.__dbfCronSchedulerRuntimeLoaded = true;
     const botClient = resolveDiscordClient();
     if (!flowRunner) return false;
 
-    const nodeId = String(node.id ?? "").trim();
-    const currentRun = (runCountMap.get(nodeId) || 0) + 1;
-    runCountMap.set(nodeId, currentRun);
+    const originalId = String(node.id ?? "").trim();
+    const runtimeId = String(node.__runtimeId || originalId).trim();
+    const uniqueKey = String(node.__uniqueId || runtimeId || originalId);
+    const currentRun = (runCountMap.get(uniqueKey) || 0) + 1;
+    runCountMap.set(uniqueKey, currentRun);
 
     const expr = String(node.properties?.cronExpression || "0 0 * * *").trim();
     const partsCount = expr.split(/\s+/).length;
     const tz = String(node.properties?.timezone || "UTC+00:00").trim();
     const desc = describeCronExpression(expr, tz);
 
+    // Set nodeId to runtimeId (e.g. '605') so DBF's compiled multi-tab condition matches,
+    // and also expose runtimeId and originalId (e.g. '761') for full compatibility.
     const payload = {
-      nodeId,
+      nodeId: runtimeId,
+      runtimeId,
+      originalId,
+      tabId: String(node.__tabKey || ""),
       cronExpression: expr,
       isQuartz: partsCount >= 6,
       timezone: tz,
@@ -770,11 +978,11 @@ globalThis.__dbfCronSchedulerRuntimeLoaded = true;
       reason
     };
 
-    if (node.properties?.logToConsole) {
-      console.log(`[CronScheduler] Triggered schedule for node "${nodeId}" - ${desc.frequency} [${desc.timezoneAbbr}] (Reason: ${reason}, Run #${currentRun})`);
+    if (toBool(node.properties?.logToConsole)) {
+      console.log(`[CronScheduler] Triggered schedule for node "${originalId}" (runtimeId: "${runtimeId}") - ${desc.frequency} [${desc.timezoneAbbr}] (Reason: ${reason}, Run #${currentRun})`);
     }
 
-    const { guild: targetGuild, channel: targetChannel } = await resolveBestGuildAndChannel(botClient);
+    const { guild: targetGuild, channel: targetChannel } = await resolveBestGuildAndChannel(botClient, node);
 
     const safeGuild = targetGuild || {
       id: "0",
@@ -805,7 +1013,7 @@ globalThis.__dbfCronSchedulerRuntimeLoaded = true;
     };
 
     const stub = {
-      id: `cron_${nodeId}_${Date.now()}`,
+      id: `cron_${runtimeId}_${Date.now()}`,
       content: "",
       author: authorUser,
       user: authorUser,
@@ -835,7 +1043,7 @@ globalThis.__dbfCronSchedulerRuntimeLoaded = true;
       await flowRunner(stub, "cronTrigger", payload);
       return true;
     } catch (err) {
-      console.error(`[CronScheduler] Error executing downstream flow for node "${nodeId}":`, err?.stack || err?.message || err);
+      console.error(`[CronScheduler] Error executing downstream flow for node "${originalId}" (runtimeId: "${runtimeId}"):`, err?.stack || err?.message || err);
       return false;
     }
   }
@@ -861,11 +1069,12 @@ globalThis.__dbfCronSchedulerRuntimeLoaded = true;
       const offsetMinutes = parseTimezoneOffset(tz);
       const zoned = getZonedParts(now, offsetMinutes);
 
+      const uniqueKey = node.__uniqueId || node.id;
       let dedupKey;
       if (hasSeconds) {
-        dedupKey = `${node.id}:${zoned.year}-${zoned.month}-${zoned.dom}-${zoned.hour}-${zoned.minute}-${zoned.second}`;
+        dedupKey = `${uniqueKey}:${zoned.year}-${zoned.month}-${zoned.dom}-${zoned.hour}-${zoned.minute}-${zoned.second}`;
       } else {
-        dedupKey = `${node.id}:${zoned.year}-${zoned.month}-${zoned.dom}-${zoned.hour}-${zoned.minute}`;
+        dedupKey = `${uniqueKey}:${zoned.year}-${zoned.month}-${zoned.dom}-${zoned.hour}-${zoned.minute}`;
       }
 
       if (executedKeys.has(dedupKey)) continue;
@@ -885,7 +1094,7 @@ globalThis.__dbfCronSchedulerRuntimeLoaded = true;
 
     const activeNodes = getActiveCronNodes();
     for (const node of activeNodes) {
-      if (node.properties?.runOnStartup) {
+      if (toBool(node.properties?.runOnStartup)) {
         triggerNodeFlow(node, "startup").catch((err) => {
           console.error(`[CronScheduler] Unhandled error during startup trigger:`, err?.stack || err?.message || err);
         });
