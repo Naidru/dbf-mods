@@ -1,0 +1,11 @@
+{
+  "id": "cron-trigger",
+  "name": "CRON Schedule Trigger",
+  "version": "1.0.0",
+  "author": "Antigravity",
+  "description": "Adds a starter node to run any set of actions based on recurring CRON schedules.",
+  "nodes": [
+    "nodes/CronTrigger.js"
+  ],
+  "runtime": "runtime.js"
+}
