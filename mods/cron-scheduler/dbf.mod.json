@@ -1,0 +1,12 @@
+{
+  "id": "cron-scheduler",
+  "name": "Cron & Quartz Schedule Trigger",
+  "version": "1.0.0",
+  "author": "Naidru",
+  "description": "Registers a starter node that automatically triggers bot flows based on recurring schedules. Supports both standard 5-part UNIX CRON and 6/7-part Quartz CRON expressions with full timezone precision.",
+  "enabled": true,
+  "nodes": [
+    "nodes/CronTrigger.js"
+  ],
+  "runtime": "runtime.js"
+}
