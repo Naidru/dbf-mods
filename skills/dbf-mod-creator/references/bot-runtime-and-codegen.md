@@ -97,18 +97,22 @@ function buildSaveVarSnippet(raw, valueExpr = "''", forcedSchema = "") {
   });
   return `
     (() => {
-      const _saveCfg = ${literal};
-      const _saveName = resolveTemplateVars(String(_saveCfg.name || ''), message).trim();
-      const _saveScope = String(_saveCfg.scope || 'local').toLowerCase();
-      const _saveSchema = String(_saveCfg.schema || '').trim().toLowerCase();
-      if (_saveName) {
-        const _val = ${valueExpr};
-        setVariable(_saveName, _val, _saveScope, message, { schema: _saveSchema, parts: _saveCfg.parts });
-        if (_val && typeof _val === 'object') {
-          for (const [k, v] of Object.entries(_val)) {
-            setVariable(\`\${_saveName}.\${k}\`, v, _saveScope, message);
+      try {
+        const _saveCfg = ${literal};
+        const _saveName = (typeof resolveTemplateVars === 'function' ? resolveTemplateVars(String(_saveCfg.name || ''), message) : String(_saveCfg.name || '')).trim();
+        const _saveScope = String(_saveCfg.scope || 'local').toLowerCase();
+        const _saveSchema = String(_saveCfg.schema || '').trim().toLowerCase();
+        if (_saveName && typeof setVariable === 'function') {
+          const _val = ${valueExpr};
+          setVariable(_saveName, _val, _saveScope, message, { schema: _saveSchema, parts: _saveCfg.parts });
+          if (_val && typeof _val === 'object') {
+            for (const [k, v] of Object.entries(_val)) {
+              setVariable(\`\${_saveName}.\${k}\`, v, _saveScope, message);
+            }
           }
         }
+      } catch (err) {
+        console.error('[DBFMod] Error saving variables:', err?.message || err);
       }
     })();`;
 }

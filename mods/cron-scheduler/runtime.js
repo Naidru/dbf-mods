@@ -643,12 +643,111 @@ globalThis.__dbfCronSchedulerRuntimeLoaded = true;
     }
   }
 
+  async function waitForClientReady(client, maxWaitMs = 5000) {
+    if (!client) return;
+    if (client.isReady && typeof client.isReady === "function" && client.isReady()) return;
+    if (client.user && client.guilds?.cache?.size) return;
+
+    await new Promise((resolve) => {
+      let resolved = false;
+      const timer = setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          resolve();
+        }
+      }, maxWaitMs);
+
+      const onReady = () => {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          resolve();
+        }
+      };
+
+      const readyEvent = (typeof Events !== "undefined" && Events && Events.ClientReady)
+        ? Events.ClientReady
+        : "clientReady";
+
+      if (typeof client.once === "function") {
+        client.once(readyEvent, onReady);
+      } else {
+        setTimeout(onReady, 1000);
+      }
+    });
+  }
+
+  async function resolveBestGuildAndChannel(botClient) {
+    if (!botClient) return { guild: null, channel: null };
+
+    // If client is still logging in, wait up to 5s for ready state so channels and guilds are populated
+    await waitForClientReady(botClient, 5000);
+
+    let targetGuild = null;
+    let targetChannel = null;
+
+    // 1. Search botClient.channels.cache directly across all guilds
+    if (botClient.channels?.cache?.size) {
+      targetChannel = botClient.channels.cache.find(
+        (c) => c && typeof c.send === "function" && (c.isTextBased?.() || c.type === 0 || c.type === "GUILD_TEXT")
+      ) || null;
+      if (targetChannel && targetChannel.guild) {
+        targetGuild = targetChannel.guild;
+      }
+    }
+
+    // 2. Iterate through all cached guilds if not found in global channels cache
+    if (!targetChannel && botClient.guilds?.cache?.size) {
+      for (const guild of botClient.guilds.cache.values()) {
+        if (!guild) continue;
+        if (guild.channels?.cache?.size) {
+          const ch = guild.channels.cache.find(
+            (c) => c && typeof c.send === "function" && (c.isTextBased?.() || c.type === 0 || c.type === "GUILD_TEXT")
+          );
+          if (ch) {
+            targetGuild = guild;
+            targetChannel = ch;
+            break;
+          }
+        }
+      }
+    }
+
+    // 3. If channels cache is empty, attempt to fetch channels for available guilds
+    if (!targetChannel && botClient.guilds?.cache?.size) {
+      for (const guild of botClient.guilds.cache.values()) {
+        if (!guild) continue;
+        if (typeof guild.channels?.fetch === "function") {
+          try {
+            const fetched = await guild.channels.fetch();
+            if (fetched && fetched.size) {
+              const ch = fetched.find(
+                (c) => c && typeof c.send === "function" && (c.isTextBased?.() || c.type === 0 || c.type === "GUILD_TEXT")
+              );
+              if (ch) {
+                targetGuild = guild;
+                targetChannel = ch;
+                break;
+              }
+            }
+          } catch (_) {}
+        }
+      }
+    }
+
+    if (!targetGuild && botClient.guilds?.cache?.size) {
+      targetGuild = botClient.guilds.cache.first() || null;
+    }
+
+    return { guild: targetGuild, channel: targetChannel };
+  }
+
   async function triggerNodeFlow(node, reason = "schedule") {
     const flowRunner = resolveFlowRunner();
     const botClient = resolveDiscordClient();
     if (!flowRunner) return false;
 
-    const nodeId = String(node.id ?? "");
+    const nodeId = String(node.id ?? "").trim();
     const currentRun = (runCountMap.get(nodeId) || 0) + 1;
     runCountMap.set(nodeId, currentRun);
 
@@ -675,20 +774,59 @@ globalThis.__dbfCronSchedulerRuntimeLoaded = true;
       console.log(`[CronScheduler] Triggered schedule for node "${nodeId}" - ${desc.frequency} [${desc.timezoneAbbr}] (Reason: ${reason}, Run #${currentRun})`);
     }
 
-    const defaultGuild = botClient?.guilds?.cache?.first?.() || null;
-    const defaultChannel =
-      defaultGuild?.channels?.cache?.find(
-        (c) => c && typeof c.isTextBased === "function" && c.isTextBased()
-      ) || null;
+    const { guild: targetGuild, channel: targetChannel } = await resolveBestGuildAndChannel(botClient);
+
+    const safeGuild = targetGuild || {
+      id: "0",
+      name: "Default Guild",
+      channels: { cache: new Map(), fetch: async () => new Map() },
+      members: { cache: new Map(), fetch: async () => new Map(), me: null }
+    };
+
+    const fallbackChannel = {
+      id: "0",
+      name: "console-fallback",
+      guild: safeGuild,
+      isTextBased: () => true,
+      send: async (msgPayload) => {
+        const text = typeof msgPayload === "string" ? msgPayload : msgPayload?.content || JSON.stringify(msgPayload);
+        console.warn(`[CronScheduler:ChannelSend] ${text}`);
+        return { id: `msg_${Date.now()}`, content: text, channel: fallbackChannel, guild: safeGuild };
+      }
+    };
+
+    const actualChannel = targetChannel || fallbackChannel;
+    const authorUser = botClient?.user || { id: "0", username: "Bot", bot: true };
+    const botMember = safeGuild?.members?.me || safeGuild?.members?.cache?.get(authorUser.id) || {
+      id: authorUser.id,
+      user: authorUser,
+      permissions: { has: () => true },
+      roles: { cache: new Map() }
+    };
 
     const stub = {
       id: `cron_${nodeId}_${Date.now()}`,
       content: "",
-      author: botClient?.user || null,
-      guild: defaultGuild,
-      channel: defaultChannel,
+      author: authorUser,
+      user: authorUser,
+      guild: safeGuild,
+      guildId: safeGuild.id || "0",
+      channel: actualChannel,
+      channelId: actualChannel.id || "0",
+      member: botMember,
       client: botClient,
-      reply: async () => {},
+      reply: async (msgPayload, ...rest) => {
+        if (typeof actualChannel.send === "function") {
+          return actualChannel.send(msgPayload, ...rest);
+        }
+        return fallbackChannel.send(msgPayload, ...rest);
+      },
+      send: async (msgPayload, ...rest) => {
+        if (typeof actualChannel.send === "function") {
+          return actualChannel.send(msgPayload, ...rest);
+        }
+        return fallbackChannel.send(msgPayload, ...rest);
+      },
       __eventType: "cronTrigger",
       __eventPayload: payload
     };
@@ -697,7 +835,7 @@ globalThis.__dbfCronSchedulerRuntimeLoaded = true;
       await flowRunner(stub, "cronTrigger", payload);
       return true;
     } catch (err) {
-      console.error(`[CronScheduler] Error running flow for node ${nodeId}:`, err?.message || err);
+      console.error(`[CronScheduler] Error executing downstream flow for node "${nodeId}":`, err?.stack || err?.message || err);
       return false;
     }
   }
@@ -734,7 +872,9 @@ globalThis.__dbfCronSchedulerRuntimeLoaded = true;
 
       if (checkScheduleMatch(expr, now, tz)) {
         executedKeys.set(dedupKey, nowMs);
-        triggerNodeFlow(node, "schedule").catch(() => {});
+        triggerNodeFlow(node, "schedule").catch((err) => {
+          console.error(`[CronScheduler] Unhandled error during scheduled execution:`, err?.stack || err?.message || err);
+        });
       }
     }
   }
@@ -746,7 +886,9 @@ globalThis.__dbfCronSchedulerRuntimeLoaded = true;
     const activeNodes = getActiveCronNodes();
     for (const node of activeNodes) {
       if (node.properties?.runOnStartup) {
-        triggerNodeFlow(node, "startup").catch(() => {});
+        triggerNodeFlow(node, "startup").catch((err) => {
+          console.error(`[CronScheduler] Unhandled error during startup trigger:`, err?.stack || err?.message || err);
+        });
       }
     }
   }
@@ -759,24 +901,31 @@ globalThis.__dbfCronSchedulerRuntimeLoaded = true;
     const botClient = resolveDiscordClient();
     if (!botClient) return;
 
+    const readyEvent = (typeof Events !== "undefined" && Events && Events.ClientReady)
+      ? Events.ClientReady
+      : "clientReady";
+
     if (botClient.isReady && typeof botClient.isReady === "function" && botClient.isReady()) {
-      triggerStartupNodes();
-      return;
-    }
-    if (botClient.user) {
       triggerStartupNodes();
       return;
     }
 
     if (!readyListenerAttached && typeof botClient.once === "function") {
       readyListenerAttached = true;
-      const readyEvent = (typeof Events !== "undefined" && Events && Events.ClientReady)
-        ? Events.ClientReady
-        : "clientReady";
-
       botClient.once(readyEvent, () => {
         triggerStartupNodes();
       });
+      // Fallback timeout in case ready was already emitted
+      setTimeout(() => {
+        if (!startupDispatched && (botClient.isReady?.() || botClient.user)) {
+          triggerStartupNodes();
+        }
+      }, 6000);
+      return;
+    }
+
+    if (botClient.user) {
+      triggerStartupNodes();
     }
   }
 

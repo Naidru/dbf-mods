@@ -1,0 +1,11 @@
+{
+  "id": "crypto-tools",
+  "name": "Crypto Tools",
+  "version": "1.0.0",
+  "author": "Naidru",
+  "description": "Cryptographically secure random code, PIN, UUID, hash, and hex byte generator for Discord Bot Factory using native Node.js crypto.",
+  "enabled": true,
+  "nodes": [
+    "nodes/GenerateRandomCode.js"
+  ]
+}

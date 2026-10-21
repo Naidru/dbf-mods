@@ -106,23 +106,45 @@ function normalizeSaveVarProp(raw) {
 // Known Cron Variable Registry & Editor Sub-Variable Autocomplete Enhancer
 // ============================================================================
 
+function getSharedCustomModVarsMap() {
+  if (!globalThis.__dbfCustomModVars || !(globalThis.__dbfCustomModVars instanceof Map)) {
+    globalThis.__dbfCustomModVars = new Map();
+  }
+  return globalThis.__dbfCustomModVars;
+}
+
+const CRON_VAR_DESCRIPTION =
+  "Saved cron schedule trigger object (supports .runCount, .timestamp, .frequency, etc.).";
+
 function getKnownCronVarsMap() {
+  const sharedMap = getSharedCustomModVarsMap();
   if (!globalThis.__dbfCronTriggerVars || !(globalThis.__dbfCronTriggerVars instanceof Map)) {
     globalThis.__dbfCronTriggerVars = new Map();
-    globalThis.__dbfCronTriggerVars.set("cron_trigger_info", {
+    const defaultEntry = {
       name: "cron_trigger_info",
-      scope: "local"
-    });
+      scope: "local",
+      schema: "cron_trigger",
+      description: CRON_VAR_DESCRIPTION,
+      parts: CRON_VARIABLE_PARTS
+    };
+    globalThis.__dbfCronTriggerVars.set("cron_trigger_info", defaultEntry);
+    sharedMap.set("cron_trigger_info", defaultEntry);
     if (typeof localStorage !== "undefined") {
       try {
         const saved = JSON.parse(localStorage.getItem("__dbf_cron_trigger_vars") || "[]");
         if (Array.isArray(saved)) {
           saved.forEach((entry) => {
             if (entry && entry.name) {
-              globalThis.__dbfCronTriggerVars.set(String(entry.name).toLowerCase(), {
+              const item = {
                 name: String(entry.name),
-                scope: entry.scope === "global" ? "global" : "local"
-              });
+                scope: entry.scope === "global" ? "global" : "local",
+                schema: "cron_trigger",
+                description: CRON_VAR_DESCRIPTION,
+                parts: CRON_VARIABLE_PARTS
+              };
+              const key = String(entry.name).toLowerCase();
+              globalThis.__dbfCronTriggerVars.set(key, item);
+              sharedMap.set(key, item);
             }
           });
         }
@@ -132,15 +154,38 @@ function getKnownCronVarsMap() {
   return globalThis.__dbfCronTriggerVars;
 }
 
+function isValidVarName(name) {
+  if (!name || typeof name !== "string") return false;
+  const trimmed = name.trim();
+  if (!trimmed || trimmed.length > 64) return false;
+  if (/^[0-9]+$/.test(trimmed)) return false;
+  if (/^[Xx]+-[Xx]+/.test(trimmed)) return false;
+  return /^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(trimmed);
+}
+
 function registerCronVarName(rawSaveVar) {
   const norm = normalizeSaveVarProp(rawSaveVar);
-  if (!norm.name) return;
+  const name = norm.name || "cron_trigger_info";
+  if (!isValidVarName(name)) return;
   const map = getKnownCronVarsMap();
-  const key = norm.name.toLowerCase();
-  map.set(key, { name: norm.name, scope: norm.scope || "local" });
+  const sharedMap = getSharedCustomModVarsMap();
+  const key = name.toLowerCase();
+  const entry = {
+    name,
+    scope: norm.scope || "local",
+    schema: "cron_trigger",
+    description: CRON_VAR_DESCRIPTION,
+    parts: CRON_VARIABLE_PARTS
+  };
+  map.set(key, entry);
+  sharedMap.set(key, entry);
   if (typeof localStorage !== "undefined") {
     try {
-      localStorage.setItem("__dbf_cron_trigger_vars", JSON.stringify(Array.from(map.values())));
+      const serializable = Array.from(map.values()).map((v) => ({
+        name: v.name,
+        scope: v.scope
+      }));
+      localStorage.setItem("__dbf_cron_trigger_vars", JSON.stringify(serializable));
     } catch (_) {}
   }
 }
@@ -222,9 +267,12 @@ function insertSubVarToken(inputEl, varName, fullToken) {
 
 function setupEditorAutocompleteEnhancer() {
   if (typeof document === "undefined" || typeof window === "undefined") return;
-  if (typeof globalThis.__dbfCronAutocompleteCleanup === "function") {
+  if (globalThis.__dbfSharedAutocompleteActive) return;
+  globalThis.__dbfSharedAutocompleteActive = true;
+
+  if (typeof globalThis.__dbfSharedAutocompleteCleanup === "function") {
     try {
-      globalThis.__dbfCronAutocompleteCleanup();
+      globalThis.__dbfSharedAutocompleteCleanup();
     } catch (_) {}
   }
 
@@ -232,17 +280,30 @@ function setupEditorAutocompleteEnhancer() {
   let isMutating = false;
   let activePopupState = null;
   let fallbackPopupEl = null;
+  let enhanceFrameId = null;
 
-  function scanGlobalGraphCronVars() {
+  function scheduleEnhance() {
+    if (enhanceFrameId !== null) return;
+    enhanceFrameId = requestAnimationFrame(() => {
+      enhanceFrameId = null;
+      enhancePopup();
+    });
+  }
+
+  function scanGlobalGraphVars() {
+    getKnownCronVarsMap();
+    const sharedMap = getSharedCustomModVarsMap();
     try {
       if (typeof LGraphCanvas !== "undefined" && LGraphCanvas.active_canvas?.graph?._nodes) {
         LGraphCanvas.active_canvas.graph._nodes.forEach((n) => {
-          if (n && n.type === "CronTrigger" && n.properties?.saveVar) {
+          if (!n || !n.properties?.saveVar) return;
+          if (n.type === "CronTrigger") {
             registerCronVarName(n.properties.saveVar);
           }
         });
       }
     } catch (_) {}
+    return sharedMap;
   }
 
   function hideFallbackPopup() {
@@ -283,7 +344,6 @@ function setupEditorAutocompleteEnhancer() {
       return;
     }
 
-    // Check if label is a direct text node on subItem and token is in tokenLeaf
     if (tokenLeaf) {
       let replacedTextNode = false;
       subItem.childNodes.forEach((node) => {
@@ -327,13 +387,14 @@ function setupEditorAutocompleteEnhancer() {
           );
         } catch (_) {}
       }
-      pc.querySelectorAll("[data-cron-subvar]").forEach((el) => el.remove());
+      pc.querySelectorAll("[data-cron-subvar], [data-dbf-subvar]").forEach((el) => el.remove());
     }
   }
 
   function renderFallbackPopup(inputEl, varMeta, subFilter) {
     const varName = varMeta.name;
-    const filteredParts = CRON_VARIABLE_PARTS.filter(
+    const partsList = Array.isArray(varMeta.parts) && varMeta.parts.length ? varMeta.parts : CRON_VARIABLE_PARTS;
+    const filteredParts = partsList.filter(
       (p) =>
         !subFilter ||
         p.name.toLowerCase().includes(subFilter) ||
@@ -445,7 +506,7 @@ function setupEditorAutocompleteEnhancer() {
       insertSelected() {
         const chosen = items[state.selectedIndex];
         if (!chosen) return;
-        insertSubVarToken(inputEl, varName, chosen.token);
+        insertSubVarToken(inputEl, chosen.varName || varName, chosen.token);
         hideFallbackPopup();
       }
     };
@@ -455,6 +516,7 @@ function setupEditorAutocompleteEnhancer() {
       const row = document.createElement("button");
       row.type = "button";
       row.setAttribute("data-cron-subvar", part.name);
+      row.setAttribute("data-dbf-subvar", `${varName}.${part.name}`);
       row.style.cssText = [
         "display: flex",
         "justify-content: space-between",
@@ -493,6 +555,7 @@ function setupEditorAutocompleteEnhancer() {
       listCol.appendChild(row);
       items.push({
         el: row,
+        varName,
         partName: part.name,
         label: part.label,
         token,
@@ -517,8 +580,7 @@ function setupEditorAutocompleteEnhancer() {
     if (isMutating) return;
     isMutating = true;
     try {
-      scanGlobalGraphCronVars();
-      const knownMap = getKnownCronVarsMap();
+      const knownMap = scanGlobalGraphVars();
       const currentInput =
         (document.activeElement &&
           (document.activeElement.tagName === "TEXTAREA" ||
@@ -527,90 +589,115 @@ function setupEditorAutocompleteEnhancer() {
         activeInputEl;
       const cursorQuery = getCursorVarQuery(currentInput);
 
-      // Find any native autocomplete item matching a known CronTrigger variable
-      let foundBaseItem = null;
-      let foundVarMeta = null;
+      // Find all native autocomplete base items matching known custom mod variables
+      const matchedBases = [];
+      const seenBaseEls = new Set();
 
-      // 1. Check already tagged base items first
-      const taggedBases = Array.from(document.querySelectorAll("[data-cron-base-var]"));
-      for (const el of taggedBases) {
-        if (!document.body.contains(el)) continue;
-        const vKey = String(el.getAttribute("data-cron-base-var") || "").toLowerCase();
-        if (knownMap.has(vKey)) {
-          foundBaseItem = el;
-          foundVarMeta = knownMap.get(vKey);
-          break;
+      const candidateElements = Array.from(
+        document.querySelectorAll(
+          "button, [role='option'], li, .autocomplete-item, [class*='item'], [class*='option'], [class*='row'], [class*='autocomplete'] *"
+        )
+      );
+
+      for (let i = 0; i < candidateElements.length; i++) {
+        const el = candidateElements[i];
+        if (el.children.length !== 0) continue;
+        if (
+          el.tagName === "INPUT" ||
+          el.tagName === "TEXTAREA" ||
+          el.tagName === "SCRIPT" ||
+          el.tagName === "STYLE" ||
+          el.tagName === "CANVAS"
+        ) {
+          continue;
         }
-      }
+        if (
+          el.closest("[data-cron-subvar]") ||
+          el.closest("[data-dbf-subvar]") ||
+          el.closest("[data-cron-fallback-popup]")
+        ) {
+          continue;
+        }
+        if (el.getAttribute("data-cron-preview-role")) continue;
 
-      // 2. Otherwise scan leaf elements for `{<varName>}`
-      if (!foundBaseItem) {
-        const allEls = document.body ? document.body.getElementsByTagName("*") : [];
-        for (let i = 0; i < allEls.length; i++) {
-          const el = allEls[i];
-          if (el.children.length !== 0) continue;
-          if (el.closest("[data-cron-subvar]") || el.closest("[data-cron-fallback-popup]")) continue;
-          if (el.getAttribute("data-cron-preview-role")) continue;
+        const txt = (el.textContent || "").trim();
+        if (!txt.startsWith("{") || !txt.endsWith("}") || txt.includes(".")) continue;
+        const rawVar = txt.slice(1, -1).trim();
+        const varKey = rawVar.toLowerCase();
+        if (!knownMap.has(varKey)) continue;
 
-          const txt = (el.textContent || "").trim();
-          if (!txt.startsWith("{") || !txt.endsWith("}") || txt.includes(".")) continue;
-          const rawVar = txt.slice(1, -1).trim();
-          const varKey = rawVar.toLowerCase();
-          if (!knownMap.has(varKey)) continue;
+        let rowCandidate = el.closest
+          ? el.closest("button, [role='option'], li, .autocomplete-item, [class*='item'], [class*='option'], [class*='row']")
+          : el.parentElement;
+        if (!rowCandidate) {
+          rowCandidate = el.parentElement;
+        }
+        if (
+          !rowCandidate ||
+          rowCandidate === document.body ||
+          rowCandidate === document.documentElement ||
+          seenBaseEls.has(rowCandidate)
+        ) {
+          continue;
+        }
+        if (["BODY", "HTML", "INPUT", "TEXTAREA", "CANVAS"].includes(rowCandidate.tagName)) {
+          continue;
+        }
 
-          let rowCandidate = el.closest
-            ? el.closest("button, [role='option'], li")
-            : el.parentElement;
-          if (!rowCandidate) {
-            rowCandidate = el.parentElement;
-            while (
-              rowCandidate &&
-              rowCandidate !== document.body &&
-              (rowCandidate.textContent || "").trim() === txt
-            ) {
-              rowCandidate = rowCandidate.parentElement;
-            }
-          }
-          if (!rowCandidate) continue;
+        const listContainer = rowCandidate.parentElement;
+        if (
+          !listContainer ||
+          listContainer === document.body ||
+          listContainer === document.documentElement
+        ) {
+          continue;
+        }
 
-          // Distinguish left list row from right preview panel (preview panel contains an "Insert" button or "Saved ... variable")
-          const rowText = (rowCandidate.textContent || "").trim();
-          if (rowText === "Insert") continue;
-          const hasInsertBtn = Array.from(rowCandidate.querySelectorAll("button")).some(
+        // Distinguish left list row from right preview panel
+        const rowText = (rowCandidate.textContent || "").trim();
+        if (rowText === "Insert") continue;
+        const hasInsertBtn = Array.from(rowCandidate.querySelectorAll("button")).some(
+          (b) => (b.textContent || "").trim() === "Insert"
+        );
+        if (hasInsertBtn) continue;
+        if (/Saved\s+(local|global)\s+/i.test(rowText)) continue;
+
+        let pCheck = rowCandidate.parentElement;
+        let insidePreviewPanel = false;
+        while (pCheck && pCheck !== document.body) {
+          const pText = pCheck.textContent || "";
+          const pHasInsert = Array.from(pCheck.querySelectorAll("button")).some(
             (b) => (b.textContent || "").trim() === "Insert"
           );
-          if (hasInsertBtn) continue;
-          if (/Saved\s+(local|global)\s+/i.test(rowText)) continue;
-
-          //Also verify rowCandidate is not inside the right preview panel
-          let pCheck = rowCandidate.parentElement;
-          let insidePreviewPanel = false;
-          while (pCheck && pCheck !== document.body) {
-            const pText = pCheck.textContent || "";
-            const pHasInsert = Array.from(pCheck.querySelectorAll("button")).some(
-              (b) => (b.textContent || "").trim() === "Insert"
-            );
-            if (pHasInsert && /Saved\s+(local|global)\s+/i.test(pText)) {
-              // Check if pCheck is strictly the right preview column (contains only 1 `{varName}` occurrence)
-              const occurrences = pText.split(`{${rawVar}}`).length - 1;
-              if (occurrences === 1) {
-                insidePreviewPanel = true;
-                break;
-              }
+          if (pHasInsert && /Saved\s+(local|global)\s+/i.test(pText)) {
+            const occurrences = pText.split(`{${rawVar}}`).length - 1;
+            if (occurrences === 1) {
+              insidePreviewPanel = true;
+              break;
             }
-            pCheck = pCheck.parentElement;
           }
-          if (insidePreviewPanel) continue;
+          pCheck = pCheck.parentElement;
+        }
+        if (insidePreviewPanel) continue;
 
-          foundBaseItem = rowCandidate;
-          foundVarMeta = knownMap.get(varKey) || { name: rawVar, scope: "local" };
-          foundBaseItem.setAttribute("data-cron-base-var", foundVarMeta.name);
-          break;
+        const varMeta = knownMap.get(varKey);
+        rowCandidate.setAttribute("data-cron-base-var", varMeta.name);
+        seenBaseEls.add(rowCandidate);
+        matchedBases.push({ baseItem: rowCandidate, varMeta });
+      }
+
+      const taggedBases = Array.from(document.querySelectorAll("[data-cron-base-var]"));
+      for (const el of taggedBases) {
+        if (!document.body.contains(el) || seenBaseEls.has(el)) continue;
+        if (el === document.body || el === document.documentElement) continue;
+        const vKey = String(el.getAttribute("data-cron-base-var") || "").toLowerCase();
+        if (knownMap.has(vKey)) {
+          seenBaseEls.add(el);
+          matchedBases.push({ baseItem: el, varMeta: knownMap.get(vKey) });
         }
       }
 
-      if (!foundBaseItem || !foundVarMeta) {
-        // If native popup isn't open, check if user typed `<cronVar>.<subFilter>` and show fallback popup
+      if (!matchedBases.length) {
         if (
           currentInput &&
           document.activeElement === currentInput &&
@@ -629,9 +716,15 @@ function setupEditorAutocompleteEnhancer() {
       // Native popup is open; hide standalone fallback popup
       hideFallbackPopup();
 
-      const varName = foundVarMeta.name;
-      const listContainer = foundBaseItem.parentElement;
-      if (!listContainer) return;
+      const firstBaseItem = matchedBases[0].baseItem;
+      const listContainer = firstBaseItem.parentElement;
+      if (
+        !listContainer ||
+        listContainer === document.body ||
+        listContainer === document.documentElement
+      ) {
+        return;
+      }
 
       // Locate popupContainer & preview elements
       let popupContainer = listContainer.parentElement;
@@ -642,7 +735,7 @@ function setupEditorAutocompleteEnhancer() {
         if (insertBtnEl) break;
         popupContainer = popupContainer.parentElement;
       }
-      if (!popupContainer) {
+      if (!popupContainer || popupContainer === document.body) {
         popupContainer = listContainer.parentElement || listContainer;
       }
 
@@ -652,7 +745,7 @@ function setupEditorAutocompleteEnhancer() {
           previewPanel &&
           previewPanel !== popupContainer &&
           !previewPanel.contains(listContainer) &&
-          !(previewPanel.textContent || "").includes(`{${varName}}`)
+          !(previewPanel.textContent || "").includes("{")
         ) {
           previewPanel = previewPanel.parentElement;
         }
@@ -664,11 +757,12 @@ function setupEditorAutocompleteEnhancer() {
             (el) => el.children.length === 0 && el !== insertBtnEl
           );
           const tokenEl =
-            leaves.find((el) => (el.textContent || "").trim() === `{${varName}}`) ||
+            leaves.find((el) => /^\{[^{}]+\}$/.test((el.textContent || "").trim())) ||
             leaves[1] ||
             null;
+          const firstVarName = matchedBases[0].varMeta.name;
           const titleEl =
-            leaves.find((el) => el !== tokenEl && (el.textContent || "").includes(varName)) ||
+            leaves.find((el) => el !== tokenEl && (el.textContent || "").includes(firstVarName)) ||
             leaves[0] ||
             null;
           const descEl =
@@ -682,27 +776,20 @@ function setupEditorAutocompleteEnhancer() {
             titleEl,
             tokenEl,
             descEl,
-            insertBtnEl,
-            origTitle: titleEl ? titleEl.textContent : `Local: ${varName}`,
-            origToken: tokenEl ? tokenEl.textContent : `{${varName}}`,
-            origDesc:
-              "Saved cron schedule trigger object (supports .runCount, .timestamp, .frequency, etc.)."
+            insertBtnEl
           };
         }
       }
 
       const previewRefs = popupContainer.__cronPreviewRefs || null;
-      const isDotQueryForThisVar =
-        cursorQuery &&
-        cursorQuery.hasDot &&
-        cursorQuery.varName.toLowerCase() === varName.toLowerCase();
-      const subFilter = isDotQueryForThisVar ? cursorQuery.subFilter : "";
+      const queryKey = cursorQuery
+        ? `${cursorQuery.varName.toLowerCase()}:${cursorQuery.hasDot ? "dot" : "root"}:${cursorQuery.subFilter}`
+        : "none";
+      const varsKey = matchedBases.map((m) => m.varMeta.name.toLowerCase()).join(",");
+      const renderKey = `${varsKey}::${queryKey}`;
 
-      const renderKey = `${varName}::${isDotQueryForThisVar ? "dot" : "root"}::${subFilter}`;
-      const existingSubEls = Array.from(listContainer.querySelectorAll("[data-cron-subvar]"));
       if (
         listContainer.getAttribute("data-cron-enhanced") === renderKey &&
-        existingSubEls.length > 0 &&
         activePopupState &&
         activePopupState.popupContainer === popupContainer
       ) {
@@ -710,56 +797,84 @@ function setupEditorAutocompleteEnhancer() {
       }
 
       listContainer.setAttribute("data-cron-enhanced", renderKey);
+      const existingSubEls = Array.from(
+        listContainer.querySelectorAll("[data-cron-subvar], [data-dbf-subvar]")
+      );
       existingSubEls.forEach((el) => el.remove());
 
-      // Ensure list container can scroll smoothly when showing sub-variables
       listContainer.style.maxHeight = listContainer.style.maxHeight || "260px";
       listContainer.style.overflowY = listContainer.style.overflowY || "auto";
 
-      // Show or hide the base `{cron_trigger_info}` item depending on whether `.` was typed
-      if (isDotQueryForThisVar) {
-        foundBaseItem.style.display = "none";
-      } else {
-        foundBaseItem.style.display = "";
-      }
-
-      const filteredParts = CRON_VARIABLE_PARTS.filter(
-        (p) =>
-          !subFilter ||
-          p.name.toLowerCase().includes(subFilter) ||
-          p.label.toLowerCase().includes(subFilter)
-      );
-
       const items = [];
-      if (!isDotQueryForThisVar) {
-        items.push({
-          el: foundBaseItem,
-          isBase: true,
-          partName: "",
-          label: previewRefs ? previewRefs.origTitle : `Local: ${varName}`,
-          token: `{${varName}}`,
-          description:
-            "Saved cron schedule trigger object (supports .runCount, .timestamp, .frequency, etc.)."
-        });
-      }
+      let initialSelectIndex = -1;
 
-      filteredParts.forEach((part) => {
-        const token = `{${varName}.${part.name}}`;
-        const subItem = foundBaseItem.cloneNode(true);
-        subItem.removeAttribute("data-cron-base-var");
-        subItem.setAttribute("data-cron-subvar", part.name);
-        subItem.style.display = "";
-        subItem.style.marginTop = "4px";
-        updateSubItemLabels(subItem, varName, part.label, token);
-        listContainer.appendChild(subItem);
+      matchedBases.forEach(({ baseItem, varMeta }) => {
+        const varName = varMeta.name;
+        const partsList = Array.isArray(varMeta.parts) && varMeta.parts.length ? varMeta.parts : CRON_VARIABLE_PARTS;
+        const isDotQueryForThisVar =
+          cursorQuery &&
+          cursorQuery.hasDot &&
+          cursorQuery.varName.toLowerCase() === varName.toLowerCase();
+        const subFilter = isDotQueryForThisVar ? cursorQuery.subFilter : "";
 
-        items.push({
-          el: subItem,
-          isBase: false,
-          partName: part.name,
-          label: part.label,
-          token,
-          description: part.description
+        if (isDotQueryForThisVar) {
+          baseItem.style.display = "none";
+        } else {
+          baseItem.style.display = "";
+          const baseIdx = items.length;
+          const scopePrefix = varMeta.scope === "global" ? "Global" : "Local";
+          items.push({
+            el: baseItem,
+            isBase: true,
+            varName,
+            partName: "",
+            label: `${scopePrefix}: ${varName}`,
+            token: `{${varName}}`,
+            description: varMeta.description || CRON_VAR_DESCRIPTION
+          });
+          if (initialSelectIndex === -1 && baseItem === listContainer.firstElementChild) {
+            initialSelectIndex = baseIdx;
+          }
+        }
+
+        const filteredParts = partsList.filter(
+          (p) =>
+            !subFilter ||
+            p.name.toLowerCase().includes(subFilter) ||
+            p.label.toLowerCase().includes(subFilter)
+        );
+
+        let insertAfterEl = baseItem;
+        filteredParts.forEach((part) => {
+          const token = `{${varName}.${part.name}}`;
+          const subItem = baseItem.cloneNode(true);
+          subItem.removeAttribute("data-cron-base-var");
+          subItem.setAttribute("data-cron-subvar", part.name);
+          subItem.setAttribute("data-dbf-subvar", `${varName}.${part.name}`);
+          subItem.style.display = "";
+          subItem.style.marginTop = "4px";
+          updateSubItemLabels(subItem, varName, part.label, token);
+
+          if (insertAfterEl.nextSibling) {
+            listContainer.insertBefore(subItem, insertAfterEl.nextSibling);
+          } else {
+            listContainer.appendChild(subItem);
+          }
+          insertAfterEl = subItem;
+
+          const subIdx = items.length;
+          items.push({
+            el: subItem,
+            isBase: false,
+            varName,
+            partName: part.name,
+            label: part.label,
+            token,
+            description: part.description
+          });
+          if (isDotQueryForThisVar && initialSelectIndex === -1) {
+            initialSelectIndex = subIdx;
+          }
         });
       });
 
@@ -767,11 +882,19 @@ function setupEditorAutocompleteEnhancer() {
         isFallback: false,
         popupContainer,
         listContainer,
-        varName,
         items,
-        selectedIndex: 0,
+        selectedIndex: initialSelectIndex,
+        clearSubSelection() {
+          state.selectedIndex = -1;
+          items.forEach((it) => {
+            if (!it.isBase) styleRowSelected(it.el, false);
+          });
+        },
         selectIndex(idx) {
-          if (idx < 0 || idx >= items.length) return;
+          if (idx < 0 || idx >= items.length) {
+            state.clearSubSelection();
+            return;
+          }
           isMutating = true;
           try {
             state.selectedIndex = idx;
@@ -791,23 +914,39 @@ function setupEditorAutocompleteEnhancer() {
         },
         insertSelected() {
           const chosen = items[state.selectedIndex];
-          if (!chosen || !currentInput) return false;
-          if (chosen.isBase) {
-            insertSubVarToken(currentInput, varName, chosen.token);
-          } else {
-            insertSubVarToken(currentInput, varName, chosen.token);
-          }
-          closeNativePopup(currentInput);
+          const targetInput =
+            (document.activeElement &&
+              (document.activeElement.tagName === "TEXTAREA" ||
+                document.activeElement.tagName === "INPUT") &&
+              !popupContainer.contains(document.activeElement) &&
+              document.activeElement) ||
+            activeInputEl ||
+            currentInput;
+          if (!chosen || !targetInput) return false;
+          insertSubVarToken(targetInput, chosen.varName, chosen.token);
+          closeNativePopup(targetInput);
           return true;
         }
       };
 
+      const itemElSet = new Set(items.map((it) => it.el));
+
       items.forEach((item, idx) => {
         if (item.isBase) {
+          item.el.__dbfBaseSelectFn = () => {
+            if (activePopupState === state) state.selectIndex(idx);
+          };
           if (!item.el.__cronBaseHooked) {
             item.el.__cronBaseHooked = true;
             item.el.addEventListener("mouseenter", () => {
-              if (activePopupState === state) state.selectIndex(idx);
+              if (typeof item.el.__dbfBaseSelectFn === "function") {
+                item.el.__dbfBaseSelectFn();
+              }
+            });
+            item.el.addEventListener("mousedown", () => {
+              if (typeof item.el.__dbfBaseSelectFn === "function") {
+                item.el.__dbfBaseSelectFn();
+              }
             });
           }
         } else {
@@ -822,8 +961,31 @@ function setupEditorAutocompleteEnhancer() {
         }
       });
 
+      listContainer.__dbfNativeRowCheck = (e) => {
+        if (activePopupState !== state) return;
+        const row = e.target && e.target.closest ? e.target.closest("button, [role='option'], li, .autocomplete-item, [class*='item']") : null;
+        if (row && listContainer.contains(row) && !itemElSet.has(row)) {
+          state.clearSubSelection();
+        }
+      };
+      if (!listContainer.__dbfContainerHooked) {
+        listContainer.__dbfContainerHooked = true;
+        listContainer.addEventListener("mouseover", (e) => {
+          if (typeof listContainer.__dbfNativeRowCheck === "function") {
+            listContainer.__dbfNativeRowCheck(e);
+          }
+        });
+        listContainer.addEventListener("mousedown", (e) => {
+          if (typeof listContainer.__dbfNativeRowCheck === "function") {
+            listContainer.__dbfNativeRowCheck(e);
+          }
+        });
+      }
+
       activePopupState = state;
-      state.selectIndex(0);
+      if (initialSelectIndex >= 0) {
+        state.selectIndex(initialSelectIndex);
+      }
     } catch (_) {
     } finally {
       isMutating = false;
@@ -833,9 +995,11 @@ function setupEditorAutocompleteEnhancer() {
   const onFocusOrInput = (e) => {
     const t = e.target;
     if (t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT")) {
-      activeInputEl = t;
+      if (!activePopupState || !activePopupState.popupContainer || !activePopupState.popupContainer.contains(t)) {
+        activeInputEl = t;
+      }
     }
-    enhancePopup();
+    scheduleEnhance();
   };
 
   const onKeyDownCapture = (e) => {
@@ -849,7 +1013,10 @@ function setupEditorAutocompleteEnhancer() {
       e.preventDefault();
       e.stopPropagation();
       e.stopImmediatePropagation();
-      const next = (activePopupState.selectedIndex + 1) % activePopupState.items.length;
+      const next =
+        activePopupState.selectedIndex < 0
+          ? 0
+          : (activePopupState.selectedIndex + 1) % activePopupState.items.length;
       activePopupState.selectIndex(next);
       return;
     }
@@ -859,14 +1026,18 @@ function setupEditorAutocompleteEnhancer() {
       e.stopPropagation();
       e.stopImmediatePropagation();
       const prev =
-        (activePopupState.selectedIndex - 1 + activePopupState.items.length) %
-        activePopupState.items.length;
+        activePopupState.selectedIndex <= 0
+          ? activePopupState.items.length - 1
+          : activePopupState.selectedIndex - 1;
       activePopupState.selectIndex(prev);
       return;
     }
 
     if (e.key === "Enter" || e.key === "Tab") {
-      const chosen = activePopupState.items[activePopupState.selectedIndex];
+      const chosen =
+        activePopupState.selectedIndex >= 0
+          ? activePopupState.items[activePopupState.selectedIndex]
+          : null;
       if (chosen && !chosen.isBase) {
         e.preventDefault();
         e.stopPropagation();
@@ -889,7 +1060,10 @@ function setupEditorAutocompleteEnhancer() {
       (btn.textContent || "").trim() === "Insert" &&
       activePopupState.popupContainer.contains(btn)
     ) {
-      const chosen = activePopupState.items[activePopupState.selectedIndex];
+      const chosen =
+        activePopupState.selectedIndex >= 0
+          ? activePopupState.items[activePopupState.selectedIndex]
+          : null;
       if (chosen && !chosen.isBase) {
         e.preventDefault();
         e.stopPropagation();
@@ -916,13 +1090,45 @@ function setupEditorAutocompleteEnhancer() {
 
   let observer = null;
   if (typeof MutationObserver !== "undefined" && document.body) {
-    observer = new MutationObserver(() => {
-      if (!isMutating) enhancePopup();
+    observer = new MutationObserver((mutations) => {
+      if (isMutating) return;
+      let foreignChange = false;
+      for (let i = 0; i < mutations.length; i++) {
+        const m = mutations[i];
+        if (m.target && m.target.hasAttribute && m.target.hasAttribute("data-cron-enhanced")) continue;
+        let onlyOurNodes = true;
+        for (let j = 0; j < m.addedNodes.length; j++) {
+          const n = m.addedNodes[j];
+          if (n.nodeType === 1 && !n.hasAttribute("data-dbf-subvar") && !n.hasAttribute("data-cron-subvar")) {
+            onlyOurNodes = false;
+            break;
+          }
+        }
+        for (let j = 0; j < m.removedNodes.length; j++) {
+          const n = m.removedNodes[j];
+          if (n.nodeType === 1 && !n.hasAttribute("data-dbf-subvar") && !n.hasAttribute("data-cron-subvar")) {
+            onlyOurNodes = false;
+            break;
+          }
+        }
+        if (!onlyOurNodes) {
+          foreignChange = true;
+          break;
+        }
+      }
+      if (foreignChange) {
+        scheduleEnhance();
+      }
     });
     observer.observe(document.body, { childList: true, subtree: true });
   }
 
-  globalThis.__dbfCronAutocompleteCleanup = () => {
+  globalThis.__dbfSharedAutocompleteCleanup = () => {
+    globalThis.__dbfSharedAutocompleteActive = false;
+    if (enhanceFrameId !== null) {
+      cancelAnimationFrame(enhanceFrameId);
+      enhanceFrameId = null;
+    }
     document.removeEventListener("focusin", onFocusOrInput, true);
     document.removeEventListener("input", onFocusOrInput, true);
     document.removeEventListener("keyup", onFocusOrInput, true);
@@ -948,18 +1154,22 @@ function buildSaveVarSnippet(raw, valueExpr = "''", forcedSchema = "cron_trigger
   });
   return `
     (() => {
-      const _saveCfg = ${literal};
-      const _saveName = resolveTemplateVars(String(_saveCfg.name || ''), message).trim();
-      const _saveScope = String(_saveCfg.scope || 'local').toLowerCase();
-      const _saveSchema = String(_saveCfg.schema || '').trim().toLowerCase();
-      if (_saveName) {
-        const _val = ${valueExpr};
-        setVariable(_saveName, _val, _saveScope, message, { schema: _saveSchema, parts: _saveCfg.parts });
-        if (_val && typeof _val === 'object') {
-          for (const [k, v] of Object.entries(_val)) {
-            setVariable(\`\${_saveName}.\${k}\`, v, _saveScope, message);
+      try {
+        const _saveCfg = ${literal};
+        const _saveName = (typeof resolveTemplateVars === 'function' ? resolveTemplateVars(String(_saveCfg.name || ''), message) : String(_saveCfg.name || '')).trim();
+        const _saveScope = String(_saveCfg.scope || 'local').toLowerCase();
+        const _saveSchema = String(_saveCfg.schema || '').trim().toLowerCase();
+        if (_saveName && typeof setVariable === 'function') {
+          const _val = ${valueExpr};
+          setVariable(_saveName, _val, _saveScope, message, { schema: _saveSchema, parts: _saveCfg.parts });
+          if (_val && typeof _val === 'object') {
+            for (const [k, v] of Object.entries(_val)) {
+              setVariable(\`\${_saveName}.\${k}\`, v, _saveScope, message);
+            }
           }
         }
+      } catch (err) {
+        console.error('[CronScheduler] Error saving trigger variable:', err?.message || err);
       }
     })();`;
 }
@@ -1594,7 +1804,7 @@ module.exports = function (DBFMod) {
         const expr = String(nodeData?.properties?.cronExpression || "0 0 * * *").trim();
         const tz = String(nodeData?.properties?.timezone || "UTC+00:00").trim();
         const desc = describeCronExpression(expr, tz);
-        const condition = `message.__eventType === 'cronTrigger' && message.__eventPayload?.nodeId === '${idEsc}'`;
+        const condition = `(message.__eventType === 'cronTrigger' && (String(message.__eventPayload?.nodeId || '').trim() === '${idEsc}' || message.__eventPayload?.nodeId == '${idEsc}'))`;
         const label = `When Cron Schedule Triggers (${expr} - ${desc.timezoneAbbr})`;
         return buildSaveVarCondition(
           condition,

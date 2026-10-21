@@ -70,19 +70,22 @@ Mod runtime scripts (`runtime.js`) are executed in the bot process when flows ar
      role: "event",
      buildCondition(nodeData, ctx) {
        const id = String(nodeData?.id ?? "").trim().replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-       const condition = `message.__eventType === 'myCustomEvent' && message.__eventPayload?.nodeId === '${id}'`;
+       // Use robust ID coercion so tabbed or numeric LiteGraph IDs match reliably
+       const condition = `(message.__eventType === 'myCustomEvent' && (String(message.__eventPayload?.nodeId || '').trim() === '${id}' || message.__eventPayload?.nodeId == '${id}'))`;
        const label = "My Custom Event";
        return buildSaveVarCondition(condition, label, nodeData?.properties?.saveVar, `(message.__eventPayload || {})`, "my_schema");
      }
    }
    ```
-3. In `runtime.js`, read `bot.config.json` (scanning both `cfg.flow.nodes` and `cfg.flowTabs.tabs[].flow.nodes` where `!tab.disabled && !node.disabled`), and when your event occurs, dispatch:
-   ```javascript
-   await flowRunner(stubMessage, "myCustomEvent", {
-     nodeId: String(node.id),
-     /* custom payload properties */
-   });
-   ```
+3. In `runtime.js`, read `bot.config.json` (scanning both `cfg.flow.nodes` and `cfg.flowTabs.tabs[].flow.nodes` where `!tab.disabled && !node.disabled`).
+4. **CRITICAL: Robust Message Stub Construction for Starter Events**:
+   When background schedulers or external events trigger a flow, there is no incoming Discord user message. Downstream action nodes (such as DBF's native "Send Message", "Reply to Message", "Send Embed", or permission checks) rely on `message.channel`, `message.guild`, `message.member`, and `message.reply`:
+   - **Never rely only on `botClient.guilds.cache.first()`**: The first guild may not be populated yet, may have no text channels, or the bot may be in multiple servers. Search `botClient.channels.cache` across all guilds, iterate through all cached guilds, and optionally fetch channels if Gateway cache has not finished populating.
+   - **Always provide a fallback channel**: If no active Discord text channel is available (e.g. when a friend runs the bot before joining a server), provide a fallback channel object with `send: async (msg) => { console.warn('[Mod:ChannelSend]', msg); }`. This prevents downstream nodes from throwing fatal `Cannot read properties of null (reading 'send')` or silently aborting.
+   - **Delegate `stub.reply`**: Route `stub.reply(...)` to `stub.channel.send(...)` so downstream "Reply" nodes actually output messages instead of silently resolving to a no-op function.
+   - **Populate `stub.guild`, `stub.member`, and IDs**: Ensure `stub.guildId`, `stub.channelId`, `stub.user`, and `stub.member` (defaulting to `guild.members.me`) are present so permission checks and guild-scoped variables succeed.
+   - **Wrap Variable Saving in `try / catch`**: Always enclose `saveSnippet` execution in `try / catch` so missing properties or scopes never cause condition evaluation to abort.
+   - See [examples/runtime-template.js](./examples/runtime-template.js) for the complete implementation.
 
 ### Contract 4: How Action Nodes & Branching Slots Work
 1. Register the node with `DBFMod.registerActionNode("CategoryName", nodeConfig)`.
@@ -92,33 +95,61 @@ Mod runtime scripts (`runtime.js`) are executed in the bot process when flows ar
      Use `helpers.buildChainForSlot(0)` and `helpers.buildChainForSlot(1)` to get the downstream code arrays for each slot, embed `(branch || []).join('\n')` inside your `if / else` blocks, and return **`skipNext: true`** so the runner does not also execute downstream nodes unconditionally afterward.
 
 ### Contract 5: Sub-Variables & Editor Autocomplete Suggestions (`{var.subVar}`)
-When a mod saves an object payload into a variable (e.g. `{ nodeId, runCount, timestamp, frequency }`), users expect to access both the full object `{my_var}` and individual fields like `{my_var.runCount}`:
-1. **Runtime Codegen**: In `buildSaveVarSnippet`, set the main object AND register each property key with `setVariable`:
+When a mod saves structured data or sub-properties into a variable (e.g. `{ code, value, format, length, timestamp }` or `{ nodeId, runCount, timestamp, frequency }`), users expect to access both the main variable `{my_var}` and individual sub-variables like `{my_var.code}` or `{my_var.runCount}`:
+1. **`variableSave` Modal Field Definition**: Always pass both `parts` and `schemaParts` alongside `saveSchema` on the `variableSave` field in `modalFields(node)`:
    ```javascript
-   setVariable(_saveName, _val, _saveScope, message, { schema: _saveSchema, parts: _saveCfg.parts });
+   {
+     label: "Save Result to Variable",
+     property: "saveVar",
+     value: node.properties.saveVar,
+     type: "variableSave",
+     saveLabel: "the result",
+     autoLabel: "my_result",
+     saveSchema: "my_schema",
+     parts: MY_VARIABLE_PARTS,
+     schemaParts: MY_VARIABLE_PARTS
+   }
+   ```
+2. **Runtime Codegen**: In `buildSaveVarSnippet`, set the main variable AND register each sub-variable property key with `setVariable`:
+   ```javascript
+   const _mainVal = (_val && typeof _val === 'object' && 'code' in _val) ? _val.code : _val;
+   setVariable(_saveName, _mainVal, _saveScope, message, { schema: _saveSchema, parts: _saveCfg.parts });
    if (_val && typeof _val === 'object') {
      for (const [k, v] of Object.entries(_val)) {
        setVariable(`${_saveName}.${k}`, v, _saveScope, message);
      }
    }
    ```
-2. **Editor Autocomplete Enhancement**: DBF's editor only knows sub-variables for built-in Discord entities (`user`, `channel`, `message`, etc.). For custom mod schemas, DBF defaults to showing `Local: <var> {<var>} — Saved local text variable`. To provide native autocomplete for `{my_var.field}`, mod editor scripts attach a lightweight DOM observer to the editor window that intercepts the autocomplete popup, renders sub-variable suggestions cloned from DBF's native row style, and updates the preview card.
+3. **Editor Autocomplete Enhancement (CRITICAL — Freeze Prevention & Layout Safety)**:
+   - DBF's editor only natively knows sub-variables for built-in Discord entities (`user`, `channel`, `message`, etc.).
+   - **NEVER** use naive selectors like `document.querySelector("[class*='autocomplete']")` or `popup.querySelector("div")`, **NEVER** overwrite `row.textContent` directly, and **NEVER** call `popup.remove()` (which permanently destroys DBF's autocomplete DOM container!).
+   - **NEVER climb ancestor containers in a `while (textContent === txt)` loop**: When the user types a specific variable name (e.g. `"cron"`), that variable may be the ONLY match in the autocomplete list. When only one item matches, the text of the item, the list wrapper, the popup container, and even `document.body` all equal `"{var}"`! Climbing ancestors causes `baseItem` to resolve to `document.body`, cloning the entire application DOM 9 times and causing an immediate, fatal UI freeze. Bound `rowCandidate` strictly to immediate list items (`el.closest("button, [role='option'], li, .autocomplete-item, [class*='item']") || el.parentElement`) and reject `document.body` or `document.documentElement`.
+   - **Debounce DOM Enhancement via `requestAnimationFrame`**: Never run `enhancePopup()` synchronously on every input or mutation. Schedule through `requestAnimationFrame` so rapid keystrokes and microtask events coalesce into at most one enhance pass per frame.
+   - **Filter Self-Mutations in `MutationObserver`**: Check `MutationRecord[]` in the observer and ignore mutations where added/removed nodes have `[data-dbf-subvar]` or target has `[data-cron-enhanced]` to eliminate feedback loops.
+   - **Coordinated Singleton Coordinator**: Guard enhancer registration with `globalThis.__dbfSharedAutocompleteActive`. All installed custom mods register variables into `globalThis.__dbfCustomModVars`, and exactly one singleton enhancer manages DOM injections and keyboard listeners without cross-mod observer battles.
+   - Always copy the complete, battle-tested `setupEditorAutocompleteEnhancer()` implementation from [references/editor-node-api.md](./references/editor-node-api.md) / [examples/action-node-template.js](./examples/action-node-template.js).
 
 ### Contract 6: Live Modal Field DOM Validation & Layout Standards
-When rendering live helper text / real-time validators under text inputs in double-click settings modals:
-1. **Flex Column Protection**: DBF modal field containers use flexbox. Appending helper text inside a horizontal flex row causes the text input to shrink into a tiny cut-off box. Always enforce vertical column layout and 100% width on the field container:
+When rendering live helper text, real-time validators, or live previews under text inputs in double-click settings modals:
+1. **Target ONLY the Specific Input (Never `inputs.forEach`)**:
+   - DBF modal field containers use flexbox, and the `variableSave` widget relies on a horizontal flex row.
+   - **NEVER** run `inputs.forEach(...)` to set `flexDirection = "column"` on all inputs in the modal — doing so breaks the `variableSave` widget layout! Apply column flex protection **ONLY** to the specific input receiving the live helper element:
    ```javascript
-   if (input.parentElement) {
-     input.parentElement.style.display = "flex";
-     input.parentElement.style.flexDirection = "column";
-     input.parentElement.style.alignItems = "stretch";
-     input.parentElement.style.width = "100%";
+   if (targetInput && targetInput.parentElement) {
+     targetInput.parentElement.style.display = "flex";
+     targetInput.parentElement.style.flexDirection = "column";
+     targetInput.parentElement.style.alignItems = "stretch";
+     targetInput.parentElement.style.width = "100%";
+     targetInput.style.width = "100%";
+     targetInput.style.minWidth = "0";
+     targetInput.style.boxSizing = "border-box";
    }
-   input.style.width = "100%";
-   input.style.minWidth = "0";
-   input.style.boxSizing = "border-box";
    ```
-2. **Placement**: Reuse existing `.field-help` / `.help` elements when available, or insert the live validator element directly after the input with `width: 100%; display: block; margin-top: 6px; clear: both; word-break: break-word;`.
+2. **Never Match Optional Inputs by Empty `el.value`**:
+   - When locating an optional input in the DOM (especially one controlled by `showWhen`), **NEVER** use `|| el.value === node.properties.myOptionalProp` when `myOptionalProp` can be `""`. When hidden, that fallback matches an empty `variableSave` input and hides or corrupts the variable picker! Match strictly by `el.name`, `el.getAttribute("data-property")`, or a unique `el.placeholder` substring.
+3. **Exclude Node Inputs & Validate Names When Watching `variableSave`**:
+   - When attaching live `input`/`change` listeners to capture custom variable names typed into `variableSave`, explicitly exclude your node's own text inputs and validate with `isValidVarName(v)` (`/^[a-zA-Z_][a-zA-Z0-9_-]*$/`, excluding numbers and patterns like `"XXXX-XXXX"`).
+4. **Placement**: Reuse existing `.field-help` / `.help` elements when available, or insert the live validator element directly after the target input with `width: 100%; display: block; margin-top: 6px; clear: both; word-break: break-word;`.
 
 ### Contract 7: Discord.js v14/v15 Event Compatibility
 Modern Discord.js (v14.15+ and v15) emits a deprecation warning if listening to `'ready'` (`DeprecationWarning: The ready event has been renamed to clientReady`). In runtime scripts, always listen to `Events.ClientReady || 'clientReady'` with a fallback to `'ready'`:

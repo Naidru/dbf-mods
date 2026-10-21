@@ -5,8 +5,13 @@
 // 1 "Trigger" output) that starts a flow when an event fires from runtime.js.
 // ============================================================================
 
+const EVENT_VARIABLE_PARTS = [
+  { name: "nodeId", label: "Node ID", type: "string", description: "Unique ID of the trigger node." },
+  { name: "timestamp", label: "Timestamp", type: "string", description: "ISO-8601 trigger timestamp." }
+];
+
 function normalizeSaveVarProp(raw) {
-  if (!raw && raw !== 0) return { name: "", scope: "local", parts: [], schema: "" };
+  if (!raw && raw !== 0) return { name: "", scope: "local", parts: EVENT_VARIABLE_PARTS, schema: "custom_event" };
   if (typeof raw === "string") {
     const trimmed = raw.trim();
     if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
@@ -17,18 +22,19 @@ function normalizeSaveVarProp(raw) {
         }
       } catch (_) {}
     }
-    return { name: trimmed, scope: "local", parts: [], schema: "" };
+    return { name: trimmed, scope: "local", parts: EVENT_VARIABLE_PARTS, schema: "custom_event" };
   }
   if (typeof raw === "object") {
     const scope = String(raw.scope || "").toLowerCase() === "global" ? "global" : "local";
+    const parts = Array.isArray(raw.parts) && raw.parts.length ? raw.parts : EVENT_VARIABLE_PARTS;
     return {
       name: String(raw.name || "").trim(),
       scope,
-      parts: Array.isArray(raw.parts) ? raw.parts : [],
-      schema: String(raw.schema || "").trim().toLowerCase()
+      parts,
+      schema: String(raw.schema || "custom_event").trim().toLowerCase()
     };
   }
-  return { name: "", scope: "local", parts: [], schema: "" };
+  return { name: "", scope: "local", parts: EVENT_VARIABLE_PARTS, schema: "custom_event" };
 }
 
 function buildSaveVarCondition(condition, label, saveVar, valueExpr, schema = "") {
@@ -41,18 +47,22 @@ function buildSaveVarCondition(condition, label, saveVar, valueExpr, schema = ""
     schema: schema || normalized.schema || ""
   });
   const saveSnippet = `(() => {
-    const _saveCfg = ${literal};
-    const _saveName = resolveTemplateVars(String(_saveCfg.name || ''), message).trim();
-    const _saveScope = String(_saveCfg.scope || 'local').toLowerCase();
-    const _saveSchema = String(_saveCfg.schema || '').trim().toLowerCase();
-    if (_saveName) {
-      const _val = ${valueExpr};
-      setVariable(_saveName, _val, _saveScope, message, { schema: _saveSchema, parts: _saveCfg.parts });
-      if (_val && typeof _val === 'object') {
-        for (const [k, v] of Object.entries(_val)) {
-          setVariable(\`\${_saveName}.\${k}\`, v, _saveScope, message);
+    try {
+      const _saveCfg = ${literal};
+      const _saveName = (typeof resolveTemplateVars === 'function' ? resolveTemplateVars(String(_saveCfg.name || ''), message) : String(_saveCfg.name || '')).trim();
+      const _saveScope = String(_saveCfg.scope || 'local').toLowerCase();
+      const _saveSchema = String(_saveCfg.schema || '').trim().toLowerCase();
+      if (_saveName && typeof setVariable === 'function') {
+        const _val = ${valueExpr};
+        setVariable(_saveName, _val, _saveScope, message, { schema: _saveSchema, parts: _saveCfg.parts });
+        if (_val && typeof _val === 'object') {
+          for (const [k, v] of Object.entries(_val)) {
+            setVariable(\`\${_saveName}.\${k}\`, v, _saveScope, message);
+          }
         }
       }
+    } catch (err) {
+      console.error('[StarterEvent] Error saving trigger variables:', err?.message || err);
     }
   })();`;
   return {
@@ -106,7 +116,7 @@ module.exports = function (DBFMod) {
         setTimeout(() => {
           try {
             const input = Array.from(document.querySelectorAll('input[type="text"]')).find(
-              el => el.name === "eventKey" || el.value === node.properties.eventKey
+              el => el.name === "eventKey" || el.placeholder === "default"
             );
             if (!input || input.__liveHooked) return;
             input.__liveHooked = true;
@@ -143,10 +153,8 @@ module.exports = function (DBFMod) {
           saveLabel: "the trigger event payload",
           autoLabel: "custom_event",
           saveSchema: "custom_event",
-          parts: [
-            { name: "nodeId", label: "Node ID", type: "string" },
-            { name: "timestamp", label: "Timestamp", type: "string" }
-          ]
+          parts: EVENT_VARIABLE_PARTS,
+          schemaParts: EVENT_VARIABLE_PARTS
         }
       ];
     },
