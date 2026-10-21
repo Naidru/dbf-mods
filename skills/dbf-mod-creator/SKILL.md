@@ -91,6 +91,46 @@ Mod runtime scripts (`runtime.js`) are executed in the bot process when flows ar
    - **Multiple Branching Output Slots** (e.g., Slot 0 = `"Success"`, Slot 1 = `"Failed"`):
      Use `helpers.buildChainForSlot(0)` and `helpers.buildChainForSlot(1)` to get the downstream code arrays for each slot, embed `(branch || []).join('\n')` inside your `if / else` blocks, and return **`skipNext: true`** so the runner does not also execute downstream nodes unconditionally afterward.
 
+### Contract 5: Sub-Variables & Editor Autocomplete Suggestions (`{var.subVar}`)
+When a mod saves an object payload into a variable (e.g. `{ nodeId, runCount, timestamp, frequency }`), users expect to access both the full object `{my_var}` and individual fields like `{my_var.runCount}`:
+1. **Runtime Codegen**: In `buildSaveVarSnippet`, set the main object AND register each property key with `setVariable`:
+   ```javascript
+   setVariable(_saveName, _val, _saveScope, message, { schema: _saveSchema, parts: _saveCfg.parts });
+   if (_val && typeof _val === 'object') {
+     for (const [k, v] of Object.entries(_val)) {
+       setVariable(`${_saveName}.${k}`, v, _saveScope, message);
+     }
+   }
+   ```
+2. **Editor Autocomplete Enhancement**: DBF's editor only knows sub-variables for built-in Discord entities (`user`, `channel`, `message`, etc.). For custom mod schemas, DBF defaults to showing `Local: <var> {<var>} — Saved local text variable`. To provide native autocomplete for `{my_var.field}`, mod editor scripts attach a lightweight DOM observer to the editor window that intercepts the autocomplete popup, renders sub-variable suggestions cloned from DBF's native row style, and updates the preview card.
+
+### Contract 6: Live Modal Field DOM Validation & Layout Standards
+When rendering live helper text / real-time validators under text inputs in double-click settings modals:
+1. **Flex Column Protection**: DBF modal field containers use flexbox. Appending helper text inside a horizontal flex row causes the text input to shrink into a tiny cut-off box. Always enforce vertical column layout and 100% width on the field container:
+   ```javascript
+   if (input.parentElement) {
+     input.parentElement.style.display = "flex";
+     input.parentElement.style.flexDirection = "column";
+     input.parentElement.style.alignItems = "stretch";
+     input.parentElement.style.width = "100%";
+   }
+   input.style.width = "100%";
+   input.style.minWidth = "0";
+   input.style.boxSizing = "border-box";
+   ```
+2. **Placement**: Reuse existing `.field-help` / `.help` elements when available, or insert the live validator element directly after the input with `width: 100%; display: block; margin-top: 6px; clear: both; word-break: break-word;`.
+
+### Contract 7: Discord.js v14/v15 Event Compatibility
+Modern Discord.js (v14.15+ and v15) emits a deprecation warning if listening to `'ready'` (`DeprecationWarning: The ready event has been renamed to clientReady`). In runtime scripts, always listen to `Events.ClientReady || 'clientReady'` with a fallback to `'ready'`:
+```javascript
+const readyEvent = (typeof Events !== "undefined" && Events.ClientReady) ? Events.ClientReady : "clientReady";
+if (client.isReady && client.isReady()) {
+  onClientReady();
+} else {
+  client.once(readyEvent, onClientReady);
+}
+```
+
 ---
 
 ## 3. Step-by-Step Workflow

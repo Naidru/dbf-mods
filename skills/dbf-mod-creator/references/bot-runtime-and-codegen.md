@@ -102,7 +102,13 @@ function buildSaveVarSnippet(raw, valueExpr = "''", forcedSchema = "") {
       const _saveScope = String(_saveCfg.scope || 'local').toLowerCase();
       const _saveSchema = String(_saveCfg.schema || '').trim().toLowerCase();
       if (_saveName) {
-        setVariable(_saveName, ${valueExpr}, _saveScope, message, { schema: _saveSchema });
+        const _val = ${valueExpr};
+        setVariable(_saveName, _val, _saveScope, message, { schema: _saveSchema, parts: _saveCfg.parts });
+        if (_val && typeof _val === 'object') {
+          for (const [k, v] of Object.entries(_val)) {
+            setVariable(\`\${_saveName}.\${k}\`, v, _saveScope, message);
+          }
+        }
       }
     })();`;
 }
@@ -142,3 +148,17 @@ If the project uses local SQLite tables (`data/dbf.sqlite`), standard database h
 - `dbfDbUpdateRows(tableRef, options)`
 - `dbfDbDeleteRows(tableRef, options)`
 - `dbfDbRunSql(sql, params, mode)`
+
+### Discord.js Client Ready Compatibility
+In `discord.js` v14.15+ and v15, listening to `'ready'` logs:
+`DeprecationWarning: The ready event has been renamed to clientReady to distinguish it from the gateway READY event and will only emit under that name in v15.`
+
+In `runtime.js`, always listen for `clientReady` with a safe fallback:
+```javascript
+const readyEvent = (typeof Events !== "undefined" && Events.ClientReady) ? Events.ClientReady : "clientReady";
+if (client.isReady && client.isReady()) {
+  onStartup();
+} else {
+  client.once(readyEvent, onStartup);
+}
+```

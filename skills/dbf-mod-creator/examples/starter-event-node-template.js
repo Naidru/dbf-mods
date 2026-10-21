@@ -46,7 +46,13 @@ function buildSaveVarCondition(condition, label, saveVar, valueExpr, schema = ""
     const _saveScope = String(_saveCfg.scope || 'local').toLowerCase();
     const _saveSchema = String(_saveCfg.schema || '').trim().toLowerCase();
     if (_saveName) {
-      setVariable(_saveName, ${valueExpr}, _saveScope, message, { schema: _saveSchema });
+      const _val = ${valueExpr};
+      setVariable(_saveName, _val, _saveScope, message, { schema: _saveSchema, parts: _saveCfg.parts });
+      if (_val && typeof _val === 'object') {
+        for (const [k, v] of Object.entries(_val)) {
+          setVariable(\`\${_saveName}.\${k}\`, v, _saveScope, message);
+        }
+      }
     }
   })();`;
   return {
@@ -95,6 +101,31 @@ module.exports = function (DBFMod) {
       ctx.fillText(`Key: ${display}`, 12, this.size[1] - 18);
     },
     modalFields(node) {
+      // Live DOM observer example for real-time validation without shrinking the input
+      if (typeof document !== "undefined") {
+        setTimeout(() => {
+          try {
+            const input = Array.from(document.querySelectorAll('input[type="text"]')).find(
+              el => el.name === "eventKey" || el.value === node.properties.eventKey
+            );
+            if (!input || input.__liveHooked) return;
+            input.__liveHooked = true;
+
+            // Enforce vertical column layout so helper text never squeezes the text input
+            const parent = input.parentElement || input.parentNode;
+            if (parent) {
+              parent.style.display = "flex";
+              parent.style.flexDirection = "column";
+              parent.style.alignItems = "stretch";
+              parent.style.width = "100%";
+            }
+            input.style.width = "100%";
+            input.style.minWidth = "0";
+            input.style.boxSizing = "border-box";
+          } catch (_) {}
+        }, 50);
+      }
+
       return [
         {
           label: "Event Key *",
@@ -111,7 +142,11 @@ module.exports = function (DBFMod) {
           type: "variableSave",
           saveLabel: "the trigger event payload",
           autoLabel: "custom_event",
-          saveSchema: "custom_event"
+          saveSchema: "custom_event",
+          parts: [
+            { name: "nodeId", label: "Node ID", type: "string" },
+            { name: "timestamp", label: "Timestamp", type: "string" }
+          ]
         }
       ];
     },

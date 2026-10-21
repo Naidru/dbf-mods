@@ -188,3 +188,92 @@ showWhen: {
   ]
 }
 ```
+
+---
+
+## 4. Live Modal Field DOM Validation & Layout Standards
+
+When a node requires live input feedback (e.g. testing regex, evaluating CRON schedules, or validating JSON) while the user types inside the configuration modal:
+
+1. **Attach in `setTimeout` inside `modalFields(node)`**:
+   Since modal DOM elements are mounted asynchronously after `modalFields(node)` returns, query the DOM after a small delay (~50ms) and guard elements with a `__liveHooked` property to avoid duplicate listeners:
+   ```javascript
+   if (typeof document !== "undefined") {
+     setTimeout(() => {
+       try {
+         const input = Array.from(document.querySelectorAll('input[type="text"]')).find(
+           el => el.name === "myProperty" || el.value === node.properties.myProperty
+         );
+         if (!input || input.__liveHooked) return;
+         input.__liveHooked = true;
+         // Attach input, change, and keyup listeners...
+       } catch (_) {}
+     }, 50);
+   }
+   ```
+
+2. **CRITICAL Layout Rule: Enforce Column Flex on Field Containers**:
+   DBF modal containers use horizontal flex rows by default. Appending helper text inside the container without modifying flex direction causes the text input to shrink into a tiny cut-off box. Always apply:
+   ```javascript
+   const parent = input.parentElement || input.parentNode;
+   if (parent) {
+     parent.style.display = "flex";
+     parent.style.flexDirection = "column";
+     parent.style.alignItems = "stretch";
+     parent.style.width = "100%";
+   }
+   input.style.width = "100%";
+   input.style.minWidth = "0";
+   input.style.boxSizing = "border-box";
+   ```
+
+3. **Validator Element Placement & Styling**:
+   Search for existing `.field-help` or `small` elements in the container first. If creating a new helper element, insert it after the input with full width:
+   ```javascript
+   if (!helpEl && parent) {
+     helpEl = document.createElement("div");
+     helpEl.className = "field-help live-validation-help";
+     if (input.nextSibling) {
+       parent.insertBefore(helpEl, input.nextSibling);
+     } else {
+       parent.appendChild(helpEl);
+     }
+   }
+   if (helpEl) {
+     helpEl.style.display = "block";
+     helpEl.style.width = "100%";
+     helpEl.style.boxSizing = "border-box";
+     helpEl.style.marginTop = "6px";
+     helpEl.style.fontSize = "12px";
+     helpEl.style.lineHeight = "1.4";
+     helpEl.style.wordBreak = "break-word";
+     helpEl.style.clear = "both";
+   }
+   ```
+
+---
+
+## 5. Custom Sub-Variables & Editor Autocomplete Enhancement
+
+When saving structured data to a variable (`saveVar`), DBF's editor only natively suggests sub-properties for built-in Discord entities (`user`, `channel`, `message`, etc.). For custom schemas, the editor displays only `Local: <var> {<var>} — Saved local text variable`.
+
+### Providing Sub-Variable Suggestions in the Editor UI:
+To make sub-variables like `{my_var.runCount}`, `{my_var.timestamp}` appear in DBF's autocomplete popup when typing `{my_var.`:
+
+1. **Define the Sub-Variable Schema**:
+   ```javascript
+   const MY_VARIABLE_PARTS = [
+     { name: "runCount", label: "Run count", type: "number", description: "Times triggered." },
+     { name: "timestamp", label: "Timestamp", type: "string", description: "ISO timestamp." }
+   ];
+   ```
+
+2. **Register Variable Names in Node Lifecycle Hooks**:
+   Track variable names configured by users across `onNodeCreated`, `onConfigure`, `onPropertyChanged`, `autoTitle`, `drawForeground`, and `modalFields` into a global registry (`globalThis.__dbfCustomModVars`).
+
+3. **Install an Autocomplete Enhancer Observer**:
+   In your node script, listen for `input`, `keyup`, and `focusin` events in `document`. When a focused text field contains `{my_var.` or `my_var.`:
+   - Detect DBF's active autocomplete popup.
+   - Clone DBF's native row element (`baseItem.cloneNode(true)`) for each defined part in `MY_VARIABLE_PARTS`.
+   - Update labels, tokens, and the right-hand preview panel (`title`, `token`, `description`).
+   - Intercept click, `Insert` button, and `Enter`/`Tab` key events to insert the `{my_var.part}` token and trigger standard `input` and `change` events on the active input.

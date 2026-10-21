@@ -119,8 +119,27 @@ globalThis.__dbfCustomModRuntimeLoaded = true;
     }
   }
 
-  // Initialize when bot is ready
-  const configPath = findProjectConfigFile();
-  const activeNodes = loadNodesByType(configPath, "CustomStarterEvent");
-  console.log(`[CustomMod] Loaded ${activeNodes.length} active CustomStarterEvent node(s).`);
+  // Attach to Discord Client ready event (with discord.js v15 clientReady compatibility)
+  function attachClientHooks() {
+    const botClient = resolveDiscordClient();
+    if (!botClient || botClient.__customModHooked) return;
+    botClient.__customModHooked = true;
+
+    const readyEvent = (typeof Events !== "undefined" && Events.ClientReady) ? Events.ClientReady : "clientReady";
+    const onReady = () => {
+      const configPath = findProjectConfigFile();
+      const activeNodes = loadNodesByType(configPath, "CustomStarterEvent");
+      console.log(`[CustomMod] Bot ready. Found ${activeNodes.length} active CustomStarterEvent node(s).`);
+    };
+
+    if (botClient.isReady && botClient.isReady()) {
+      onReady();
+    } else {
+      botClient.once(readyEvent, onReady);
+    }
+  }
+
+  // Periodic poll or initial hook
+  attachClientHooks();
+  setInterval(attachClientHooks, 3000);
 })();
